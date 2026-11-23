@@ -1,0 +1,802 @@
+// Pure in-memory ZevmBackend Layer for deterministic, zero-native-dependency
+// unit tests and cross-platform execution (Node, Bun, Browser, Workers, Deno).
+// Implements the core ZEVM JSON-RPC 2.0 contract: accounts, balances, nonces,
+// code, storage, blocks, automine/manual mining, snapshots/revert, impersonation,
+// time controls, state dump/load, batches, notifications, and error codes.
+
+import { ZevmBindingError } from "../errors.vibe"
+import { parseJson, stringifyJson, toQuantityHex, utf8ToHex, hexToUtf8 } from "../hex.vibe"
+import { parseHexToBigInt, safeBigInt } from "./math.ts"
+import {
+  type LightClientConfig,
+  type NativeNodeConfig,
+  ZevmBackend,
+  type ZevmLightClientHandle,
+  type ZevmNodeHandle,
+} from "../services/backend.vibe"
+import type {
+  AccountStateWire,
+  Address,
+  BlockObject,
+  Bytes32,
+  Hash32,
+  Hex,
+  LogObject,
+  MiningMode,
+  QuantityHex,
+  ReceiptObject,
+  StateDump,
+  TransactionObject,
+} from "../types.vibe"
+
+export const DEFAULT_DEV_ACCOUNTS: readonly Address[] = [
+  "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+  "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+  "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+  "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+  "0x15d34aaf54267db7d7c367839aaf71a00a2c6a65",
+]
+
+const ZERO_HASH: Hash32 = "0x0000000000000000000000000000000000000000000000000000000000000000"
+const ZERO_BLOOM: Hex = `0x${"0".repeat(512)}` as Hex
+
+function deterministicHash(seed: string): Hash32 {
+  let h1 = 0x811c9dc5n
+  let h2 = 0xcbf29ce484222325n
+  for (let i = 0; i < seed.length; i++) {
+    const c = safeBigInt(seed.charCodeAt(i))
+    h1 = ((h1 ^ c) * 0x01000193n) & 0xffffffffn
+    h2 = ((h2 ^ c) * 0x100000001b3n) & 0xffffffffffffffffn
+  }
+  const part = `${h1.toString(16).padStart(8, "0")}${h2.toString(16).padStart(16, "0")}`
+  return `0x${part.repeat(3).slice(0, 64)}` as Hash32
+}
+
+interface MutableAccount {
+  balance: bigint
+  nonce: bigint
+  code: Hex
+  storage: Map<string, Bytes32>
+}
+
+interface PendingTx {
+  readonly hash: Hash32
+  readonly from: Address
+  readonly to: Address | null
+  readonly value: bigint
+  readonly gas: bigint
+  readonly nonce: bigint
+  readonly input: Hex
+}
+
+interface SnapshotRecord {
+  readonly accounts: Map<string, { balance: bigint; nonce: bigint; code: Hex; storage: Map<string, Bytes32> }>
+  readonly blockNumber: bigint
+  readonly timestamp: bigint
+  readonly timeOffset: bigint
+  readonly blocks: readonly BlockObject<true>[]
+  readonly receipts: Map<string, ReceiptObject>
+  readonly txs: Map<string, TransactionObject>
+  readonly logs: readonly LogObject[]
+  readonly impersonated: Set<string>
+  readonly autoImpersonate: boolean
+  readonly miningMode: MiningMode
+}
+
+function cloneAccounts(
+  source: Map<string, MutableAccount>,
+): Map<string, MutableAccount> {
+  const out = new Map<string, MutableAccount>()
+  for (const [k, v] of source.entries()) {
+    out.set(k, {
+      balance: v.balance,
+      nonce: v.nonce,
+      code: v.code,
+      storage: new Map(v.storage),
+    })
+  }
+  return out
+}
+
+function makeBlock(
+  number: bigint,
+  parentHash: Hash32,
+  timestamp: bigint,
+  coinbase: Address,
+  gasLimit: bigint,
+  txs: readonly TransactionObject[],
+): BlockObject<true> {
+  const hash = deterministicHash(`block:${number}:${timestamp}:${txs.length}`)
+  return {
+    hash,
+    parentHash,
+    sha3Uncles: ZERO_HASH,
+    miner: coinbase,
+    stateRoot: ZERO_HASH,
+    transactionsRoot: ZERO_HASH,
+    receiptsRoot: ZERO_HASH,
+    logsBloom: ZERO_BLOOM,
+    number: toQuantityHex(number),
+    gasLimit: toQuantityHex(gasLimit),
+    gasUsed: toQuantityHex(safeBigInt(txs.length) * 21000n),
+    timestamp: toQuantityHex(timestamp),
+    extraData: "0x",
+    mixHash: ZERO_HASH,
+    nonce: "0x0000000000000000",
+    size: "0x100",
+    transactions: txs,
+    uncles: [],
+    difficulty: "0x0",
+    totalDifficulty: "0x0",
+    baseFeePerGas: "0x3b9aca00",
+  }
+}
+
+function toLightBlock(block: BlockObject<true>): BlockObject<false> {
+  return {
+    ...block,
+    transactions: block.transactions.map((t) => t.hash),
+  }
+}
+
+function parseHexBigInt(input: unknown, fallback: bigint = 0n): bigint {
+  return parseHexToBigInt(input, fallback)
+}
+
+/**
+ * Pure in-memory `ZevmBackend` Layer.
+ * Ideal for fast deterministic unit testing, browser sandboxes, and CI environments
+ * where native binaries are not installed.
+ */
+export const ZevmBackendMemory = Layer.succeed(ZevmBackend, {
+  name: "zevm-memory",
+  effect version() {
+    return "zevm-memory/0.1.0"
+  },
+  effect abiVersion() {
+    return 1
+  },
+  effect createNode(config: NativeNodeConfig) {
+    let chainId = config.chainId ?? 31337
+    let closed = false
+    let miningMode: MiningMode = "auto"
+    let intervalSeconds = 0n
+    let coinbase: Address = DEFAULT_DEV_ACCOUNTS[0]
+    let blockGasLimit = 30_000_000n
+    let timestamp = 1_700_000_000n
+    let timeOffset = 0n
+    let nextBlockTimestamp: bigint | null = null
+    let forkUrl: string | null = null
+    let forkBlockNumber: bigint | null = null
+    let autoImpersonate = false
+    let nextSnapshotId = 1n
+    let txCounter = 0
+
+    const accounts = new Map<string, MutableAccount>()
+    for (const addr of DEFAULT_DEV_ACCOUNTS) {
+      accounts.set(addr.toLowerCase(), {
+        balance: 10_000n * 10n ** 18n,
+        nonce: 0n,
+        code: "0x",
+        storage: new Map(),
+      })
+    }
+
+    let blocks: BlockObject<true>[] = [
+      makeBlock(0n, ZERO_HASH, timestamp, coinbase, blockGasLimit, []),
+    ]
+    const receipts = new Map<string, ReceiptObject>()
+    const txs = new Map<string, TransactionObject>()
+    let logs: LogObject[] = []
+    let pending: PendingTx[] = []
+    const impersonated = new Set<string>()
+    const snapshots = new Map<string, SnapshotRecord>()
+
+    function getOrCreateAccount(address: string): MutableAccount {
+      const key = address.toLowerCase()
+      let acc = accounts.get(key)
+      if (acc === undefined) {
+        acc = { balance: 0n, nonce: 0n, code: "0x", storage: new Map() }
+        accounts.set(key, acc)
+      }
+      return acc
+    }
+
+    function mineSingleBlock(customStep?: bigint) {
+      const parent = blocks[blocks.length - 1]
+      const nextNum = safeBigInt(blocks.length)
+      if (nextBlockTimestamp !== null) {
+        timestamp = nextBlockTimestamp
+        nextBlockTimestamp = null
+      } else {
+        const step = customStep !== undefined && customStep > 0n ? customStep : 1n
+        timestamp = timestamp + step + timeOffset
+        timeOffset = 0n
+      }
+
+      const toInclude = pending
+      pending = []
+      const minedTxs: TransactionObject[] = []
+      const tempHash = deterministicHash(`block:${nextNum}:${timestamp}:${toInclude.length}`)
+
+      for (let idx = 0; idx < toInclude.length; idx++) {
+        const ptx = toInclude[idx]
+        const sender = getOrCreateAccount(ptx.from)
+        if (sender.balance >= ptx.value) {
+          sender.balance = sender.balance - ptx.value
+        }
+        sender.nonce = sender.nonce + 1n
+
+        let contractAddress: Address | null = null
+        if (ptx.to !== null) {
+          const recipient = getOrCreateAccount(ptx.to)
+          recipient.balance = recipient.balance + ptx.value
+        } else {
+          const created = `0x${deterministicHash(`create:${ptx.from}:${ptx.nonce}`).slice(26)}` as Address
+          contractAddress = created
+          const deployed = getOrCreateAccount(created)
+          deployed.code = ptx.input
+          deployed.balance = deployed.balance + ptx.value
+        }
+
+        const txObj: TransactionObject = {
+          type: "0x0",
+          hash: ptx.hash,
+          nonce: toQuantityHex(ptx.nonce),
+          blockHash: tempHash,
+          blockNumber: toQuantityHex(nextNum),
+          transactionIndex: toQuantityHex(idx),
+          from: ptx.from,
+          to: ptx.to,
+          value: toQuantityHex(ptx.value),
+          gas: toQuantityHex(ptx.gas),
+          gasPrice: "0x3b9aca00",
+          input: ptx.input,
+        }
+        minedTxs.push(txObj)
+        txs.set(ptx.hash.toLowerCase(), txObj)
+
+        const txLogs: LogObject[] = []
+        if (ptx.to !== null && ptx.input.length > 2) {
+          const logEntry: LogObject = {
+            removed: false,
+            logIndex: toQuantityHex(logs.length),
+            transactionIndex: toQuantityHex(idx),
+            transactionHash: ptx.hash,
+            blockHash: tempHash,
+            blockNumber: toQuantityHex(nextNum),
+            address: ptx.to,
+            data: ptx.input,
+            topics: [deterministicHash(`topic:${ptx.to}:${ptx.input}`)],
+          }
+          txLogs.push(logEntry)
+          logs.push(logEntry)
+        }
+
+        receipts.set(ptx.hash.toLowerCase(), {
+          transactionHash: ptx.hash,
+          transactionIndex: toQuantityHex(idx),
+          blockHash: tempHash,
+          blockNumber: toQuantityHex(nextNum),
+          from: ptx.from,
+          to: ptx.to,
+          cumulativeGasUsed: toQuantityHex(safeBigInt(idx + 1) * 21000n),
+          gasUsed: "0x5208",
+          contractAddress,
+          logs: txLogs,
+          logsBloom: ZERO_BLOOM,
+          status: "0x1",
+          root: null,
+          effectiveGasPrice: "0x3b9aca00",
+          type: "0x0",
+          blobGasUsed: null,
+          blobGasPrice: null,
+        })
+      }
+
+      const block = makeBlock(nextNum, parent.hash, timestamp, coinbase, blockGasLimit, minedTxs)
+      blocks.push(block)
+      return block
+    }
+
+    function resolveBlockIndex(selector: unknown): number | null {
+      if (
+        selector === undefined
+        || selector === "latest"
+        || selector === "pending"
+        || selector === "safe"
+        || selector === "finalized"
+      ) {
+        return blocks.length - 1
+      }
+      if (selector === "earliest") return 0
+      const num = Number(parseHexBigInt(selector, -1n))
+      if (num < 0 || num >= blocks.length) return null
+      return num
+    }
+
+    effect function dispatchSingle(req: {
+      readonly id?: string | number | null
+      readonly method?: unknown
+      readonly params?: unknown
+    }): unknown!never {
+      const id = req.id
+      if (typeof req.method !== "string") {
+        return { jsonrpc: "2.0", id: id ?? null, error: { code: -32600, message: "Invalid Request" } }
+      }
+      const method = req.method
+      const params = Array.isArray(req.params) ? req.params : []
+
+      function ok(result: unknown) {
+        if (id === undefined) return null
+        return { jsonrpc: "2.0", id, result }
+      }
+      function fail(code: number, message: string) {
+        if (id === undefined) return null
+        return { jsonrpc: "2.0", id, error: { code, message } }
+      }
+
+      if (method === "eth_chainId") return ok(toQuantityHex(chainId))
+      if (method === "net_version") return ok(String(chainId))
+      if (method === "web3_clientVersion") return ok("zevm-memory/0.1.0")
+      if (method === "web3_sha3") {
+        const data = typeof params[0] === "string" ? params[0] : "0x"
+        return ok(deterministicHash(`sha3:${data}`))
+      }
+      if (method === "rpc_modules") {
+        return ok({ eth: "1.0", net: "1.0", web3: "1.0", rpc: "1.0", txpool: "1.0", debug: "1.0", zevm: "1.0" })
+      }
+      if (method === "eth_blockNumber") return ok(toQuantityHex(blocks.length - 1))
+      if (method === "eth_accounts") return ok([...DEFAULT_DEV_ACCOUNTS])
+      if (method === "eth_coinbase") return ok(coinbase)
+      if (method === "eth_gasPrice") return ok("0x3b9aca00")
+      if (method === "eth_maxPriorityFeePerGas") return ok("0x0")
+      if (method === "eth_blobBaseFee") return ok("0x1")
+      if (method === "eth_mining") return ok(miningMode !== "manual")
+
+      if (method === "eth_getBalance") {
+        const addr = String(params[0] ?? "").toLowerCase()
+        const acc = accounts.get(addr)
+        return ok(toQuantityHex(acc?.balance ?? 0n))
+      }
+      if (method === "eth_getCode") {
+        const addr = String(params[0] ?? "").toLowerCase()
+        const acc = accounts.get(addr)
+        return ok(acc?.code ?? "0x")
+      }
+      if (method === "eth_getTransactionCount") {
+        const addr = String(params[0] ?? "").toLowerCase()
+        const acc = accounts.get(addr)
+        return ok(toQuantityHex(acc?.nonce ?? 0n))
+      }
+      if (method === "eth_getStorageAt") {
+        const addr = String(params[0] ?? "").toLowerCase()
+        const slot = String(params[1] ?? "").toLowerCase()
+        const acc = accounts.get(addr)
+        return ok(acc?.storage.get(slot) ?? ZERO_HASH)
+      }
+
+      if (method === "eth_call") {
+        const tx = (params[0] ?? {}) as Record<string, unknown>
+        const to = typeof tx["to"] === "string" ? tx["to"].toLowerCase() : null
+        const input = typeof tx["data"] === "string" ? tx["data"] : typeof tx["input"] === "string" ? tx["input"] : "0x"
+        if (to !== null) {
+          const target = accounts.get(to)
+          if (target !== undefined && target.code !== "0x") {
+            return ok(target.code)
+          }
+        }
+        return ok(input)
+      }
+      if (method === "eth_estimateGas") {
+        return ok("0x5208")
+      }
+
+      if (method === "eth_sendTransaction") {
+        const tx = (params[0] ?? {}) as Record<string, unknown>
+        const from = typeof tx["from"] === "string" ? (tx["from"] as Address) : DEFAULT_DEV_ACCOUNTS[0]
+        const fromKey = from.toLowerCase()
+        const isManaged = DEFAULT_DEV_ACCOUNTS.some((a) => a.toLowerCase() === fromKey)
+        if (!isManaged && !autoImpersonate && !impersonated.has(fromKey)) {
+          return fail(-32603, `Sender ${from} is not managed or impersonated`)
+        }
+        const to = typeof tx["to"] === "string" ? (tx["to"] as Address) : null
+        const value = parseHexBigInt(tx["value"], 0n)
+        const gas = parseHexBigInt(tx["gas"], 21000n)
+        const senderAcc = getOrCreateAccount(from)
+        const nonce = tx["nonce"] !== undefined ? parseHexBigInt(tx["nonce"], senderAcc.nonce) : senderAcc.nonce
+        const input =
+          (typeof tx["data"] === "string" ? tx["data"] : typeof tx["input"] === "string" ? tx["input"] : "0x") as Hex
+        txCounter++
+        const hash = deterministicHash(`tx:${txCounter}:${from}:${to ?? "create"}:${nonce}:${value}`)
+        pending.push({ hash, from, to, value, gas, nonce, input })
+        if (miningMode === "auto") {
+          mineSingleBlock()
+        }
+        return ok(hash)
+      }
+
+      if (method === "eth_getBlockByNumber") {
+        const idx = resolveBlockIndex(params[0])
+        if (idx === null) return ok(null)
+        const full = Boolean(params[1])
+        return ok(full ? blocks[idx] : toLightBlock(blocks[idx]))
+      }
+      if (method === "eth_getBlockByHash") {
+        const hash = String(params[0] ?? "").toLowerCase()
+        const full = Boolean(params[1])
+        const found = blocks.find((b) => b.hash.toLowerCase() === hash)
+        if (found === undefined) return ok(null)
+        return ok(full ? found : toLightBlock(found))
+      }
+      if (method === "eth_getTransactionByHash") {
+        const hash = String(params[0] ?? "").toLowerCase()
+        return ok(txs.get(hash) ?? null)
+      }
+      if (method === "eth_getTransactionReceipt") {
+        const hash = String(params[0] ?? "").toLowerCase()
+        return ok(receipts.get(hash) ?? null)
+      }
+      if (method === "eth_getBlockReceipts") {
+        const idx = resolveBlockIndex(params[0])
+        if (idx === null) return ok(null)
+        const blk = blocks[idx]
+        const list: ReceiptObject[] = []
+        for (const tx of blk.transactions) {
+          const rec = receipts.get(tx.hash.toLowerCase())
+          if (rec !== undefined) list.push(rec)
+        }
+        return ok(list)
+      }
+      if (method === "eth_getLogs") {
+        const filter = (params[0] ?? {}) as Record<string, unknown>
+        const fromIdx = filter["fromBlock"] !== undefined
+          ? (resolveBlockIndex(filter["fromBlock"]) ?? 0)
+          : blocks.length - 1
+        const toIdx = filter["toBlock"] !== undefined
+          ? (resolveBlockIndex(filter["toBlock"]) ?? blocks.length - 1)
+          : blocks.length - 1
+        const addrFilter = filter["address"]
+        const matched = logs.filter((entry) => {
+          const bn = Number(parseHexBigInt(entry.blockNumber, 0n))
+          if (bn < fromIdx || bn > toIdx) return false
+          if (typeof addrFilter === "string") {
+            return entry.address.toLowerCase() === addrFilter.toLowerCase()
+          }
+          if (Array.isArray(addrFilter)) {
+            return addrFilter.some((a) => String(a).toLowerCase() === entry.address.toLowerCase())
+          }
+          return true
+        })
+        return ok(matched)
+      }
+
+      // ZEVM / Anvil / Hardhat state & node controls
+      if (method === "zevm_getAccount") {
+        const addr = String(params[0] ?? "").toLowerCase()
+        const acc = accounts.get(addr)
+        const storageObj: Record<string, Bytes32> = {}
+        if (acc !== undefined) {
+          for (const [k, v] of acc.storage.entries()) storageObj[k] = v
+        }
+        return ok({
+          balance: toQuantityHex(acc?.balance ?? 0n),
+          nonce: toQuantityHex(acc?.nonce ?? 0n),
+          code: acc?.code ?? "0x",
+          storage: storageObj,
+        })
+      }
+      if (
+        method === "zevm_setBalance" || method === "anvil_setBalance" || method === "hardhat_setBalance"
+        || method === "zevm_deal" || method === "anvil_deal"
+      ) {
+        const acc = getOrCreateAccount(String(params[0] ?? ""))
+        acc.balance = parseHexBigInt(params[1], 0n)
+        return ok(true)
+      }
+      if (method === "zevm_addBalance" || method === "anvil_addBalance") {
+        const acc = getOrCreateAccount(String(params[0] ?? ""))
+        acc.balance = acc.balance + parseHexBigInt(params[1], 0n)
+        return ok(true)
+      }
+      if (method === "zevm_setCode" || method === "anvil_setCode" || method === "hardhat_setCode") {
+        const acc = getOrCreateAccount(String(params[0] ?? ""))
+        acc.code = String(params[1] ?? "0x") as Hex
+        return ok(true)
+      }
+      if (method === "zevm_setNonce" || method === "anvil_setNonce" || method === "hardhat_setNonce") {
+        const acc = getOrCreateAccount(String(params[0] ?? ""))
+        acc.nonce = parseHexBigInt(params[1], 0n)
+        return ok(true)
+      }
+      if (method === "zevm_setStorageAt" || method === "anvil_setStorageAt" || method === "hardhat_setStorageAt") {
+        const acc = getOrCreateAccount(String(params[0] ?? ""))
+        acc.storage.set(String(params[1] ?? "").toLowerCase(), String(params[2] ?? ZERO_HASH) as Bytes32)
+        return ok(true)
+      }
+      if (method === "zevm_setChainId" || method === "anvil_setChainId") {
+        chainId = Number(parseHexBigInt(params[0], safeBigInt(chainId)))
+        return ok(true)
+      }
+      if (method === "zevm_setCoinbase" || method === "anvil_setCoinbase") {
+        coinbase = String(params[0] ?? coinbase) as Address
+        return ok(true)
+      }
+      if (method === "zevm_setBlockGasLimit" || method === "anvil_setBlockGasLimit") {
+        blockGasLimit = parseHexBigInt(params[0], blockGasLimit)
+        return ok(true)
+      }
+      if (method === "zevm_getAutomine" || method === "anvil_getAutomine") {
+        return ok(miningMode === "auto")
+      }
+      if (method === "zevm_setAutomine" || method === "anvil_setAutomine" || method === "evm_setAutomine") {
+        miningMode = params[0] ? "auto" : "manual"
+        intervalSeconds = 0n
+        return ok(true)
+      }
+      if (method === "zevm_getIntervalMining" || method === "anvil_getIntervalMining") {
+        return ok(toQuantityHex(intervalSeconds))
+      }
+      if (
+        method === "zevm_setIntervalMining" || method === "anvil_setIntervalMining"
+        || method === "evm_setIntervalMining"
+      ) {
+        intervalSeconds = parseHexBigInt(params[0], 0n)
+        miningMode = intervalSeconds > 0n ? "interval" : "manual"
+        return ok(true)
+      }
+      if (method === "zevm_mine" || method === "anvil_mine" || method === "hardhat_mine" || method === "evm_mine") {
+        const count = Number(parseHexBigInt(params[0], 1n))
+        const step = params[1] !== undefined ? parseHexBigInt(params[1], 1n) : undefined
+        for (let i = 0; i < count; i++) {
+          mineSingleBlock(step)
+        }
+        return ok(true)
+      }
+      if (method === "zevm_mineDetailed" || method === "anvil_mineDetailed") {
+        const count = Number(parseHexBigInt(params[0], 1n))
+        const step = params[1] !== undefined ? parseHexBigInt(params[1], 1n) : undefined
+        const mined: { number: QuantityHex; hash: Hash32; timestamp: QuantityHex }[] = []
+        for (let i = 0; i < count; i++) {
+          const blk = mineSingleBlock(step)
+          mined.push({ number: blk.number, hash: blk.hash, timestamp: blk.timestamp })
+        }
+        return ok(mined)
+      }
+      if (method === "zevm_snapshot" || method === "anvil_snapshot" || method === "evm_snapshot") {
+        const sid = toQuantityHex(nextSnapshotId)
+        nextSnapshotId = nextSnapshotId + 1n
+        snapshots.set(sid, {
+          accounts: cloneAccounts(accounts),
+          blockNumber: safeBigInt(blocks.length - 1),
+          timestamp,
+          timeOffset,
+          blocks: [...blocks],
+          receipts: new Map(receipts),
+          txs: new Map(txs),
+          logs: [...logs],
+          impersonated: new Set(impersonated),
+          autoImpersonate,
+          miningMode,
+        })
+        return ok(sid)
+      }
+      if (method === "zevm_revert" || method === "anvil_revert" || method === "evm_revert") {
+        const sid = String(params[0] ?? "")
+        const snap = snapshots.get(sid)
+        if (snap === undefined) return ok(false)
+        accounts.clear()
+        for (const [k, v] of cloneAccounts(snap.accounts).entries()) accounts.set(k, v)
+        blocks = [...snap.blocks]
+        timestamp = snap.timestamp
+        timeOffset = snap.timeOffset
+        receipts.clear()
+        for (const [k, v] of snap.receipts.entries()) receipts.set(k, v)
+        txs.clear()
+        for (const [k, v] of snap.txs.entries()) txs.set(k, v)
+        logs = [...snap.logs]
+        impersonated.clear()
+        for (const a of snap.impersonated) impersonated.add(a)
+        autoImpersonate = snap.autoImpersonate
+        miningMode = snap.miningMode
+        return ok(true)
+      }
+      if (method === "zevm_impersonateAccount" || method === "anvil_impersonateAccount") {
+        impersonated.add(String(params[0] ?? "").toLowerCase())
+        return ok(true)
+      }
+      if (method === "zevm_stopImpersonatingAccount" || method === "anvil_stopImpersonatingAccount") {
+        impersonated.delete(String(params[0] ?? "").toLowerCase())
+        return ok(true)
+      }
+      if (method === "zevm_autoImpersonateAccount" || method === "anvil_autoImpersonateAccount") {
+        autoImpersonate = Boolean(params[0])
+        return ok(true)
+      }
+      if (method === "zevm_increaseTime" || method === "anvil_increaseTime" || method === "evm_increaseTime") {
+        timeOffset = timeOffset + parseHexBigInt(params[0], 0n)
+        return ok(toQuantityHex(timeOffset))
+      }
+      if (method === "zevm_setNextBlockTimestamp" || method === "anvil_setNextBlockTimestamp") {
+        nextBlockTimestamp = parseHexBigInt(params[0], timestamp + 1n)
+        return ok(true)
+      }
+      if (method === "zevm_setTime" || method === "anvil_setTime") {
+        timestamp = parseHexBigInt(params[0], timestamp)
+        return ok(toQuantityHex(timestamp))
+      }
+      if (method === "zevm_dumpState" || method === "anvil_dumpState") {
+        const dumpAccounts: Record<string, AccountStateWire> = {}
+        const keys = Array.from(accounts.keys()).sort()
+        for (const key of keys) {
+          const acc = accounts.get(key)
+          if (acc === undefined) continue
+          const storageObj: Record<string, Bytes32> = {}
+          for (const [sk, sv] of acc.storage.entries()) storageObj[sk] = sv
+          dumpAccounts[key] = {
+            balance: toQuantityHex(acc.balance),
+            nonce: toQuantityHex(acc.nonce),
+            code: acc.code,
+            storage: storageObj,
+          }
+        }
+        const dump: StateDump = { version: 1, accounts: dumpAccounts }
+        const json = (stringifyJson(dump)) catch () => "{}"
+        return ok(utf8ToHex(json))
+      }
+      if (method === "zevm_loadState" || method === "anvil_loadState") {
+        const blob = String(params[0] ?? "0x") as Hex
+        const text = (hexToUtf8(blob)) catch () => ""
+        const parsed = (parseJson(text)) catch () => null
+        if (parsed === null || typeof parsed !== "object" || !("accounts" in parsed)) {
+          return fail(-32602, "Invalid state blob")
+        }
+        const stateDump = parsed as StateDump
+        accounts.clear()
+        for (const [addr, wire] of Object.entries(stateDump.accounts)) {
+          const storage = new Map<string, Bytes32>()
+          for (const [sk, sv] of Object.entries(wire.storage)) {
+            storage.set(sk.toLowerCase(), sv)
+          }
+          accounts.set(addr.toLowerCase(), {
+            balance: parseHexBigInt(wire.balance, 0n),
+            nonce: parseHexBigInt(wire.nonce, 0n),
+            code: wire.code,
+            storage,
+          })
+        }
+        return ok(true)
+      }
+      if (method === "zevm_reset" || method === "anvil_reset" || method === "hardhat_reset") {
+        if (params.length > 0 && params[0] === null) {
+          forkUrl = null
+          forkBlockNumber = null
+        } else if (params.length > 0 && typeof params[0] === "object" && params[0] !== null) {
+          const cfg = params[0] as Record<string, unknown>
+          if (typeof cfg["url"] === "string") forkUrl = cfg["url"]
+          forkBlockNumber = cfg["blockNumber"] !== undefined ? parseHexBigInt(cfg["blockNumber"], 0n) : null
+        }
+        blocks = [makeBlock(0n, ZERO_HASH, timestamp, coinbase, blockGasLimit, [])]
+        pending = []
+        snapshots.clear()
+        impersonated.clear()
+        return ok(true)
+      }
+      if (method === "zevm_metadata" || method === "anvil_metadata") {
+        return ok({
+          mode: "trusted",
+          chainId: toQuantityHex(chainId),
+          forking: forkUrl !== null,
+          forkUrl,
+          forkBlockNumber: forkBlockNumber !== null ? toQuantityHex(forkBlockNumber) : null,
+        })
+      }
+      if (method === "zevm_nodeInfo" || method === "anvil_nodeInfo") {
+        return ok({
+          chainId: toQuantityHex(chainId),
+          coinbase,
+          blockNumber: toQuantityHex(blocks.length - 1),
+          managedAccounts: [...DEFAULT_DEV_ACCOUNTS],
+          mining: {
+            type: miningMode,
+            blockTime: miningMode === "interval" ? toQuantityHex(intervalSeconds) : null,
+          },
+          fork: {
+            enabled: forkUrl !== null,
+            url: forkUrl,
+            blockNumber: forkBlockNumber !== null ? toQuantityHex(forkBlockNumber) : null,
+          },
+        })
+      }
+      if (method === "txpool_status") {
+        return ok({ pending: toQuantityHex(pending.length), queued: "0x0" })
+      }
+      if (method === "zevm_dropAllTransactions") {
+        const count = pending.length
+        pending = []
+        return ok(toQuantityHex(count))
+      }
+
+      return fail(-32601, `Method not found: ${method}`)
+    }
+
+    const handle: ZevmNodeHandle = {
+      effect rpc(rawJson: string) {
+        if (closed) {
+          throw new ZevmBindingError({ reason: "node is closed" })
+        }
+        const parsed = (parseJson(rawJson)) catch () => undefined
+        if (parsed === undefined) {
+          return JSON.stringify({
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: -32700, message: "Parse error" },
+          })
+        }
+        if (Array.isArray(parsed)) {
+          if (parsed.length === 0) {
+            return JSON.stringify({
+              jsonrpc: "2.0",
+              id: null,
+              error: { code: -32600, message: "Invalid Request" },
+            })
+          }
+          const responses: unknown[] = []
+          for (const item of parsed) {
+            const res = try dispatchSingle(item as { id?: string | number | null; method?: unknown; params?: unknown })
+            if (res !== null) responses.push(res)
+          }
+          if (responses.length === 0) return null
+          return (stringifyJson(responses)) catch effect (e) => {
+            throw new ZevmBindingError({ reason: e.message, cause: e })
+          }
+        }
+        const single = try dispatchSingle(
+          parsed as { id?: string | number | null; method?: unknown; params?: unknown },
+        )
+        if (single === null) return null
+        return (stringifyJson(single)) catch effect (e) => {
+          throw new ZevmBindingError({ reason: e.message, cause: e })
+        }
+      },
+      effect close() {
+        closed = true
+      },
+    }
+
+    return handle
+  },
+  effect createLightClient(_config: LightClientConfig) {
+    let steps = 0
+    const handle: ZevmLightClientHandle = {
+      effect syncStep() {
+        steps++
+        return steps
+      },
+      effect status() {
+        if (steps === 0) return "not_synced"
+        if (steps === 1) return "syncing"
+        return "synced"
+      },
+      effect lastError() {
+        return null
+      },
+      effect getBalance(_address: Address, _blockNumber?: number) {
+        return "0xde0b6b3a7640000"
+      },
+      effect getTransactionCount(_address: Address, _blockNumber?: number) {
+        return "0x1"
+      },
+      effect getCode(_address: Address, _blockNumber?: number) {
+        return "0x"
+      },
+      effect getStorage(_address: Address, _slot: Bytes32, _blockNumber?: number) {
+        return ZERO_HASH
+      },
+      effect close() {
+        // nothing to release
+      },
+    }
+    return handle
+  },
+})

@@ -1,0 +1,477 @@
+// TEVM & ZEVM trusted-mode actions.
+// Exposes the complete ZEVM `zevm_*` surface as composable Effect programs, plus
+// Effect-native superpowers like scoped `withSnapshot` (auto-reverts even on failure
+// or interruption), scoped `withImpersonation`, and `StateStorage`-integrated persistence!
+
+import { CodecError, JsonRpcParseError, SnapshotNotFoundError, StorageError, TransportError } from "../errors.vibe"
+import {
+  formatBlockSelector,
+  formatStateOverrideSet,
+  formatTransactionRequest,
+  hexToUtf8,
+  parseJson,
+  parseQuantityHex,
+  stringifyJson,
+  toQuantityHex,
+  utf8ToHex,
+} from "../hex.vibe"
+import { StateStorage } from "../services/storage.vibe"
+import { Transport } from "../services/transport.vibe"
+import type {
+  AccountState,
+  AccountStateWire,
+  Address,
+  BlockSelector,
+  Bytes32,
+  CallParams,
+  CallResult,
+  ForkConfig,
+  Hash32,
+  Hex,
+  MineParams,
+  MinedBlockSummary,
+  NodeInfo,
+  NodeMetadata,
+  QuantityHex,
+  ReceiptObject,
+  SetAccountParams,
+  StateDump,
+} from "../types.vibe"
+
+// Call / Execution
+
+/**
+ * Simulate an EVM call (`eth_call`), or submit (`addToMempool`) and optionally
+ * mine (`addToBlockchain`) a transaction in trusted mode.
+ */
+export effect function tevmCall(params: CallParams): CallResult!TransportError!Transport {
+  const transport = try Transport
+  const tx = formatTransactionRequest(params)
+
+  if (params.addToMempool || params.addToBlockchain) {
+    if (tx["from"] === undefined) {
+      const accounts = try transport.request<readonly Address[]>("eth_accounts")
+      if (accounts.length > 0) {
+        tx["from"] = accounts[0]
+      }
+    }
+    const txHash = try transport.request<Hash32>("eth_sendTransaction", [tx])
+    if (!params.addToBlockchain) {
+      return { rawData: "0x", txHash }
+    }
+    let receipt = try transport.request<ReceiptObject | null>("eth_getTransactionReceipt", [txHash])
+    if (receipt === null) {
+      try transport.request<boolean>("zevm_mine")
+      receipt = try transport.request<ReceiptObject | null>("eth_getTransactionReceipt", [txHash])
+    }
+    return { rawData: "0x", txHash, receipt }
+  }
+
+  const rpcParams: unknown[] = [tx, formatBlockSelector(params.blockTag)]
+  if (params.stateOverride !== undefined) {
+    rpcParams.push(formatStateOverrideSet(params.stateOverride))
+  }
+  const rawData = try transport.request<Hex>("eth_call", rpcParams)
+  return { rawData }
+}
+
+// Account & State Controls
+
+export effect function tevmGetAccount(
+  address: Address,
+  block?: BlockSelector,
+): AccountState!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const params: unknown[] = block === undefined ? [address] : [address, formatBlockSelector(block)]
+  const raw = try transport.request<AccountStateWire>("zevm_getAccount", params)
+  return {
+    address,
+    balance: try parseQuantityHex(raw.balance),
+    nonce: try parseQuantityHex(raw.nonce),
+    code: raw.code,
+    storage: raw.storage,
+  }
+}
+
+/**
+ * Update specified account fields in trusted state.
+ * Preserves unspecified fields by performing individual ZEVM mutations.
+ */
+export effect function tevmSetAccount(params: SetAccountParams): void!TransportError!Transport {
+  const transport = try Transport
+  if (params.balance !== undefined) {
+    try transport.request<boolean>("zevm_setBalance", [params.address, toQuantityHex(params.balance)])
+  }
+  if (params.nonce !== undefined) {
+    try transport.request<boolean>("zevm_setNonce", [params.address, toQuantityHex(params.nonce)])
+  }
+  if (params.code !== undefined) {
+    try transport.request<boolean>("zevm_setCode", [params.address, params.code])
+  }
+  if (params.storage !== undefined) {
+    for (const [slot, value] of Object.entries(params.storage)) {
+      try transport.request<boolean>("zevm_setStorageAt", [params.address, slot, value])
+    }
+  }
+}
+
+export effect function tevmSetBalance(
+  address: Address,
+  balance: bigint | QuantityHex,
+): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setBalance", [address, toQuantityHex(balance)])
+}
+
+export effect function tevmAddBalance(
+  address: Address,
+  delta: bigint | QuantityHex,
+): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_addBalance", [address, toQuantityHex(delta)])
+}
+
+export effect function tevmSetCode(address: Address, code: Hex): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setCode", [address, code])
+}
+
+export effect function tevmSetNonce(
+  address: Address,
+  nonce: bigint | number | QuantityHex,
+): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setNonce", [address, toQuantityHex(nonce)])
+}
+
+export effect function tevmSetStorageAt(
+  address: Address,
+  slot: Bytes32,
+  value: Bytes32,
+): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setStorageAt", [address, slot, value])
+}
+
+export effect function tevmDeal(
+  address: Address,
+  value: bigint | QuantityHex,
+): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_deal", [address, toQuantityHex(value)])
+}
+
+export effect function tevmDealErc20(
+  token: Address,
+  address: Address,
+  value: bigint | QuantityHex,
+): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_dealErc20", [token, address, toQuantityHex(value)])
+}
+
+export effect function tevmSetErc20Allowance(
+  token: Address,
+  owner: Address,
+  spender: Address,
+  value: bigint | QuantityHex,
+): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setErc20Allowance", [
+    token,
+    owner,
+    spender,
+    toQuantityHex(value),
+  ])
+}
+
+// Mining Controls
+
+export effect function tevmMine(params: MineParams = {}): boolean!TransportError!Transport {
+  const transport = try Transport
+  const rpcParams: unknown[] = []
+  if (params.blocks !== undefined || params.intervalSeconds !== undefined) {
+    rpcParams.push(toQuantityHex(params.blocks ?? 1))
+  }
+  if (params.intervalSeconds !== undefined) {
+    rpcParams.push(toQuantityHex(params.intervalSeconds))
+  }
+  return try transport.request<boolean>("zevm_mine", rpcParams)
+}
+
+export effect function tevmMineDetailed(
+  params: MineParams = {},
+): (readonly MinedBlockSummary[])!TransportError!Transport {
+  const transport = try Transport
+  const rpcParams: unknown[] = []
+  if (params.blocks !== undefined || params.intervalSeconds !== undefined) {
+    rpcParams.push(toQuantityHex(params.blocks ?? 1))
+  }
+  if (params.intervalSeconds !== undefined) {
+    rpcParams.push(toQuantityHex(params.intervalSeconds))
+  }
+  return try transport.request<readonly MinedBlockSummary[]>("zevm_mineDetailed", rpcParams)
+}
+
+export effect function tevmGetAutomine(): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_getAutomine")
+}
+
+export effect function tevmSetAutomine(enabled: boolean): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setAutomine", [enabled])
+}
+
+export effect function tevmGetIntervalMining(): bigint!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const hex = try transport.request<QuantityHex>("zevm_getIntervalMining")
+  return try parseQuantityHex(hex)
+}
+
+export effect function tevmSetIntervalMining(seconds: number | bigint): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setIntervalMining", [toQuantityHex(seconds)])
+}
+
+// State Dump / Load & Storage Persistence
+
+export effect function tevmDumpState(): Hex!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Hex>("zevm_dumpState")
+}
+
+export effect function tevmLoadState(stateBlob: Hex): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_loadState", [stateBlob])
+}
+
+export effect function tevmDumpStateDecoded(): StateDump!(TransportError | CodecError | JsonRpcParseError)!Transport {
+  const hex = try tevmDumpState()
+  const jsonText = try hexToUtf8(hex)
+  return (try parseJson(jsonText)) as StateDump
+}
+
+export effect function tevmLoadStateDecoded(dump: StateDump): boolean!(TransportError | CodecError)!Transport {
+  const jsonText = try stringifyJson(dump)
+  return try tevmLoadState(utf8ToHex(jsonText))
+}
+
+/** Dump current ZEVM state and save it into the injected `StateStorage` under `key`. */
+export effect function saveStateToStorage(
+  key: string,
+): Hex!(TransportError | StorageError)!(Transport | StateStorage) {
+  const storage = try StateStorage
+  const blob = try tevmDumpState()
+  try storage.set(key, blob)
+  return blob
+}
+
+/** Restore ZEVM state from the injected `StateStorage` by `key`. Returns false if key is absent. */
+export effect function restoreStateFromStorage(
+  key: string,
+): boolean!(TransportError | StorageError)!(Transport | StateStorage) {
+  const storage = try StateStorage
+  const maybeBlob = try storage.get(key)
+  if (Option.isNone(maybeBlob)) return false
+  return try tevmLoadState(maybeBlob.value)
+}
+
+// Snapshots & Scoped Auto-Rollback
+
+export effect function tevmSnapshot(): QuantityHex!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<QuantityHex>("zevm_snapshot")
+}
+
+export effect function tevmRevert(
+  snapshotId: QuantityHex,
+): boolean!(TransportError | SnapshotNotFoundError)!Transport {
+  const transport = try Transport
+  const reverted = try transport.request<boolean>("zevm_revert", [snapshotId])
+  if (!reverted) {
+    throw new SnapshotNotFoundError({ snapshotId })
+  }
+  return true
+}
+
+/**
+ * Effect-native scoped snapshot: takes a ZEVM snapshot before running `body`,
+ * and guarantees reverting to that snapshot when the scope exits — even on failure
+ * or fiber interruption! Ideal for isolated tests and speculative simulations.
+ */
+export effect function withSnapshot<A, E, R>(
+  body: A!E!R,
+): A!(E | TransportError)!(R | Transport) {
+  return try scoped(
+    effect {
+      const snapshotId = try acquireRelease(tevmSnapshot(), (id) =>
+        Effect.ignore(
+          effect {
+            const transport = try Transport
+            try transport.request<boolean>("zevm_revert", [id])
+          },
+        ))
+      void snapshotId
+      return try body
+    },
+  )
+}
+
+// Impersonation & Scoped Impersonation
+
+export effect function tevmImpersonateAccount(address: Address): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_impersonateAccount", [address])
+}
+
+export effect function tevmStopImpersonatingAccount(address: Address): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_stopImpersonatingAccount", [address])
+}
+
+export effect function tevmAutoImpersonateAccount(enabled: boolean): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_autoImpersonateAccount", [enabled])
+}
+
+/**
+ * Effect-native scoped impersonation: impersonates `address` for the duration of `body`
+ * and guarantees calling `zevm_stopImpersonatingAccount` on exit, failure, or interruption.
+ */
+export effect function withImpersonation<A, E, R>(
+  address: Address,
+  body: A!E!R,
+): A!(E | TransportError)!(R | Transport) {
+  return try scoped(
+    effect {
+      try acquireRelease(tevmImpersonateAccount(address), () => Effect.ignore(tevmStopImpersonatingAccount(address)))
+      return try body
+    },
+  )
+}
+
+// Time Controls
+
+export effect function tevmIncreaseTime(
+  seconds: number | bigint,
+): bigint!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const hex = try transport.request<QuantityHex>("zevm_increaseTime", [toQuantityHex(seconds)])
+  return try parseQuantityHex(hex)
+}
+
+export effect function tevmSetNextBlockTimestamp(
+  timestamp: number | bigint,
+): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setNextBlockTimestamp", [toQuantityHex(timestamp)])
+}
+
+export effect function tevmSetTime(
+  timestamp: number | bigint,
+): bigint!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const hex = try transport.request<QuantityHex>("zevm_setTime", [toQuantityHex(timestamp)])
+  return try parseQuantityHex(hex)
+}
+
+export effect function tevmSetBlockTimestampInterval(
+  seconds: number | bigint,
+): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setBlockTimestampInterval", [toQuantityHex(seconds)])
+}
+
+export effect function tevmRemoveBlockTimestampInterval(): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_removeBlockTimestampInterval")
+}
+
+// Chain, Fork, Block Env, TxPool & Metadata Controls
+
+export effect function tevmReset(forkConfig?: ForkConfig | null): boolean!TransportError!Transport {
+  const transport = try Transport
+  if (forkConfig === undefined) {
+    return try transport.request<boolean>("zevm_reset")
+  }
+  if (forkConfig === null) {
+    return try transport.request<boolean>("zevm_reset", [null])
+  }
+  const payload: Record<string, unknown> = { url: forkConfig.url }
+  if (forkConfig.blockNumber !== undefined) {
+    payload["blockNumber"] = toQuantityHex(forkConfig.blockNumber)
+  }
+  return try transport.request<boolean>("zevm_reset", [payload])
+}
+
+export effect function tevmSetRpcUrl(url: string): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setRpcUrl", [url])
+}
+
+export effect function tevmSetChainId(chainId: number | bigint): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setChainId", [toQuantityHex(chainId)])
+}
+
+export effect function tevmSetCoinbase(address: Address): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setCoinbase", [address])
+}
+
+export effect function tevmSetBlockGasLimit(gasLimit: bigint | number): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setBlockGasLimit", [toQuantityHex(gasLimit)])
+}
+
+export effect function tevmSetNextBlockBaseFeePerGas(
+  baseFee: bigint | number,
+): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setNextBlockBaseFeePerGas", [toQuantityHex(baseFee)])
+}
+
+export effect function tevmSetPrevRandao(prevRandao: Hash32): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setPrevRandao", [prevRandao])
+}
+
+export effect function tevmSetMinGasPrice(gasPrice: bigint | number): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_setMinGasPrice", [toQuantityHex(gasPrice)])
+}
+
+export effect function tevmDropTransaction(txHash: Hash32): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("zevm_dropTransaction", [txHash])
+}
+
+export effect function tevmDropAllTransactions(): bigint!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const hex = try transport.request<QuantityHex>("zevm_dropAllTransactions")
+  return try parseQuantityHex(hex)
+}
+
+export effect function tevmRemovePoolTransactions(
+  txHashes: readonly Hash32[],
+): bigint!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const hex = try transport.request<QuantityHex>("zevm_removePoolTransactions", [txHashes])
+  return try parseQuantityHex(hex)
+}
+
+export effect function tevmMetadata(): NodeMetadata!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<NodeMetadata>("zevm_metadata")
+}
+
+export effect function tevmNodeInfo(): NodeInfo!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<NodeInfo>("zevm_nodeInfo")
+}
+
+export effect function tevmRpcModules(): Readonly<Record<string, string>>!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Readonly<Record<string, string>>>("rpc_modules")
+}

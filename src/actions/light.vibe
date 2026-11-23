@@ -1,0 +1,79 @@
+// ZEVM Light Client Service & Actions.
+// Exposes proof-backed, consensus-anchored light reads as an Effect-scoped service
+// backed by the injected `ZevmBackend`, plus an Effect Stream of sync progression.
+
+import { CodecError, TransportError, ZevmBindingError } from "../errors.vibe"
+import { parseQuantityHex } from "../hex.vibe"
+import { type LightClientConfig, type LightClientStatusCode, ZevmBackend } from "../services/backend.vibe"
+import { Transport } from "../services/transport.vibe"
+import type { Address, Bytes32, Hex, LightSyncStatus } from "../types.vibe"
+
+export interface LightSyncProgress {
+  readonly stepResult: number
+  readonly status: LightClientStatusCode
+  readonly lastError: string | null
+}
+
+export service LightClient {
+  static readonly key = "@tevm/effect/LightClient"
+  readonly syncStep: () => number!ZevmBindingError
+  readonly status: () => LightClientStatusCode!ZevmBindingError
+  readonly lastError: () => (string | null)!ZevmBindingError
+  readonly getBalance: (address: Address, blockNumber?: number) => bigint!(ZevmBindingError | CodecError)
+  readonly getTransactionCount: (address: Address, blockNumber?: number) => bigint!(ZevmBindingError | CodecError)
+  readonly getCode: (address: Address, blockNumber?: number) => Hex!ZevmBindingError
+  readonly getStorage: (address: Address, slot: Bytes32, blockNumber?: number) => Bytes32!ZevmBindingError
+  readonly syncStream: (pollInterval?: Duration.Input) => Stream.Stream<LightSyncProgress, ZevmBindingError>
+}
+
+/**
+ * Acquire a scoped ZEVM proof-backed `LightClient` Layer from the injected `ZevmBackend`.
+ */
+export function LightClientLive(config: LightClientConfig) {
+  return Layer.effect(
+    LightClient,
+    effect {
+      const backend = try ZevmBackend
+      const handle = try backend.createLightClient(config)
+
+      function syncStream(
+        pollInterval: Duration.Input = "250 millis",
+      ): Stream.Stream<LightSyncProgress, ZevmBindingError> {
+        effect function* produce() {
+          while (true) {
+            const stepResult = try handle.syncStep()
+            const currentStatus = try handle.status()
+            const err = try handle.lastError()
+            yield { stepResult, status: currentStatus, lastError: err }
+            if (currentStatus === "synced") return
+            try sleep(pollInterval)
+          }
+        }
+        return produce()
+      }
+
+      return {
+        syncStep: handle.syncStep,
+        status: handle.status,
+        lastError: handle.lastError,
+        effect getBalance(address: Address, blockNumber: number = 0) {
+          const hex = try handle.getBalance(address, blockNumber)
+          return try parseQuantityHex(hex)
+        },
+        effect getTransactionCount(address: Address, blockNumber: number = 0) {
+          const hex = try handle.getTransactionCount(address, blockNumber)
+          return try parseQuantityHex(hex)
+        },
+        getCode: handle.getCode,
+        getStorage: handle.getStorage,
+        syncStream,
+      }
+    },
+  )
+}
+
+/** Query `zevm_lightSyncStatus` over any injected `Transport` talking to a light-mode ZEVM node. */
+export effect function getLightSyncStatus(): LightSyncStatus!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<LightSyncStatus>("zevm_lightSyncStatus")
+}

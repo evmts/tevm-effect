@@ -1,0 +1,278 @@
+import { assert, describe, it } from "@effect/vitest"
+import * as NodeServices from "@effect/platform-node/NodeServices"
+import { TestClock } from "effect/testing"
+import {
+  AnvilCommon,
+  classifyRpcError,
+  Common,
+  Evm,
+  ExecutionRevertedError,
+  fallbackTransport,
+  GasCapExceededError,
+  getBlockNumber,
+  getChainId,
+  JsonRpcMethodNotFoundError,
+  LightNotReadyError,
+  makeCommonLayer,
+  ModeUnsupportedError,
+  restoreStateFromStorage,
+  saveStateToStorage,
+  StateStorage,
+  StateStorageFileSystem,
+  testTransport,
+  tevmGetAccount,
+  tevmSetBalance,
+  TevmCoreLive,
+  TevmEngineLayer,
+  Transport,
+  TransportError,
+  withChainId,
+  withHardfork,
+  withMining,
+  withTransportLogging,
+  withTransportRetry,
+  withTransportTimeout,
+  ZevmBackendFromTransport,
+} from "../index.vibe"
+import { DEFAULT_DEV_ACCOUNTS, ZevmBackendMemory } from "../testing/index.vibe"
+import { toVoltaireTransport, VoltaireAbiCodec } from "../voltaire/index.vibe"
+import { AbiCodec } from "../services/codec.vibe"
+
+const MemoryTevm = Layer.provideMerge(
+  TevmCoreLive,
+  Layer.merge(AnvilCommon, ZevmBackendMemory),
+)
+
+describe("Common DI service", () => {
+  it.effect("composes chain presets with Layer combinators", effect () => {
+    const CustomLayer = Layer.provide(
+      withMining({ mode: "manual" }),
+      Layer.provide(
+        withHardfork("prague"),
+        Layer.provide(withChainId(424242), AnvilCommon),
+      ),
+    )
+
+    provide CustomLayer {
+      const common = try Common
+      try Effect.try(() => assert.strictEqual(common.chainId, 424242))
+      try Effect.try(() => assert.strictEqual(common.hardfork, "prague"))
+      try Effect.try(() => assert.strictEqual(common.mining.mode, "manual"))
+    }
+  })
+
+  it.effect("rejects invalid config with typed InvalidConfigError", effect () => {
+    const badLayer = makeCommonLayer({ chainId: -1 })
+    const tag = Effect.provide(Common, badLayer) catch (err) => err._tag
+    try Effect.try(() => assert.strictEqual(tag, "InvalidConfigError"))
+  })
+})
+
+describe("Typed RPC Error Classification", () => {
+  it("classifies ZEVM JSON-RPC error codes into exact tagged errors", () => {
+    assert.strictEqual(
+      classifyRpcError("foo_bar", { code: -32601, message: "Method not found" }) instanceof JsonRpcMethodNotFoundError,
+      true,
+    )
+    assert.strictEqual(
+      classifyRpcError("eth_call", { code: -32010, message: "Unsupported in light mode" })
+        instanceof ModeUnsupportedError,
+      true,
+    )
+    assert.strictEqual(
+      classifyRpcError("eth_blockNumber", { code: -32011, message: "Light client not ready" })
+        instanceof LightNotReadyError,
+      true,
+    )
+    assert.strictEqual(
+      classifyRpcError("eth_sendTransaction", { code: -32000, message: "transaction gas limit exceeds Osaka cap" })
+        instanceof GasCapExceededError,
+      true,
+    )
+    const rev = classifyRpcError("eth_call", { code: 3, message: "execution reverted", data: "0x08c379a0" })
+    assert.strictEqual(rev instanceof ExecutionRevertedError, true)
+  })
+})
+
+describe("Evm service & PubSub EngineEvent stream", () => {
+  it.effect("executes serialized RPC, batches, and broadcasts EngineEvents", effect () => {
+    provide MemoryTevm {
+      const evm = try Evm
+      const eventFiber = fork Stream.runCollect(Stream.take(evm.events, 2))
+      try Effect.yieldNow
+
+      const chainId = try evm.request<string>("eth_chainId")
+      try Effect.try(() => assert.strictEqual(chainId, "0x7a69"))
+
+      const batchResults = try evm.batch([
+        { method: "eth_chainId" },
+        { method: "eth_blockNumber" },
+        { method: "does_not_exist" },
+      ])
+      try Effect.try(() => assert.strictEqual(batchResults.length, 3))
+      try Effect.try(() => assert.strictEqual(batchResults[0]?.result, "0x7a69"))
+      try Effect.try(() => assert.strictEqual(batchResults[1]?.result, "0x0"))
+      try Effect.try(() => assert.strictEqual(batchResults[2]?.error instanceof JsonRpcMethodNotFoundError, true))
+
+      const collected = try join eventFiber
+      try Effect.try(() => assert.strictEqual(collected.length, 2))
+      try Effect.try(() => assert.strictEqual(collected[0]?._tag, "Request"))
+      try Effect.try(() => assert.strictEqual(collected[1]?._tag, "Response"))
+    }
+  })
+})
+
+describe("Transport DI & Layer Decorators", () => {
+  it.effect("retries transient failures with withTransportRetry", effect () => {
+    let attempts = 0
+    const flaky = testTransport(effect (method) => {
+      attempts++
+      if (attempts < 3) {
+        throw new TransportError({ transport: "flaky", method, message: "temporary blip" })
+      }
+      return "0x2a"
+    })
+    const retried = Layer.provide(withTransportRetry(Schedule.recurs(3)), flaky)
+
+    provide retried {
+      const bn = try getBlockNumber()
+      try Effect.try(() => assert.strictEqual(bn, 42n))
+      try Effect.try(() => assert.strictEqual(attempts, 3))
+    }
+  })
+
+  it.effect("falls back across transports with fallbackTransport", effect () => {
+    const failingShape: Transport.Shape = {
+      effect request(method: string) {
+        throw new TransportError({ transport: "primary", method, message: "down" })
+      },
+      effect rpc() {
+        throw new TransportError({ transport: "primary", message: "down" })
+      },
+    }
+    const backupShape: Transport.Shape = {
+      effect request<T>() {
+        return "0x1" as T
+      },
+      effect rpc() {
+        return "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"0x1\"}"
+      },
+    }
+
+    provide fallbackTransport([failingShape, backupShape]) {
+      const chainId = try getChainId()
+      try Effect.try(() => assert.strictEqual(chainId, 1n))
+    }
+  })
+
+  it.effect("times out slow transports deterministically with TestClock", effect () => {
+    const slow = testTransport(effect () => {
+      try sleep("5 seconds")
+      return "0x1"
+    })
+    const timed = Layer.provide(withTransportTimeout("1 second"), slow)
+
+    provide timed {
+      const fiber = fork (effect {
+        return getBlockNumber() catch (e) => e._tag
+      })
+      try TestClock.adjust("2 seconds")
+      const errTag = try join fiber
+      try Effect.try(() => assert.strictEqual(errTag, "TransportError"))
+    }
+  })
+
+  it.effect("wraps transport with structured logging & spans", effect () => {
+    const logged = Layer.provide(
+      withTransportLogging,
+      Layer.provide(TevmEngineLayer, Layer.merge(AnvilCommon, ZevmBackendMemory)),
+    )
+    provide logged {
+      const chainId = try getChainId()
+      try Effect.try(() => assert.strictEqual(chainId, 31337n))
+    }
+  })
+
+  it.effect("mounts any Transport as a remote ZevmBackend (browser / worker mode)", effect () => {
+    const serverTransport = Layer.provide(
+      TevmEngineLayer,
+      Layer.merge(AnvilCommon, ZevmBackendMemory),
+    )
+    const remoteBackend = Layer.provide(ZevmBackendFromTransport, serverTransport)
+    const remoteClient = Layer.provide(
+      TevmEngineLayer,
+      Layer.merge(AnvilCommon, remoteBackend),
+    )
+
+    provide remoteClient {
+      const chainId = try getChainId()
+      try Effect.try(() => assert.strictEqual(chainId, 31337n))
+    }
+  })
+})
+
+describe("StateStorage DI (Memory & Effect FileSystem)", () => {
+  it.effect("persists and restores ZEVM state via StateStorageMemory", effect () => {
+    provide MemoryTevm {
+      const target = DEFAULT_DEV_ACCOUNTS[1]
+      try tevmSetBalance(target, 777_000n)
+      try saveStateToStorage("checkpoint-1")
+
+      try tevmSetBalance(target, 1n)
+      const afterMut = try tevmGetAccount(target)
+      try Effect.try(() => assert.strictEqual(afterMut.balance, 1n))
+
+      const restored = try restoreStateFromStorage("checkpoint-1")
+      try Effect.try(() => assert.strictEqual(restored, true))
+      const afterRestore = try tevmGetAccount(target)
+      try Effect.try(() => assert.strictEqual(afterRestore.balance, 777_000n))
+    }
+  })
+
+  it.effect("persists state through platform-agnostic Effect FileSystem layer", effect () => {
+    provide NodeServices.layer {
+      const fs = try FileSystem.FileSystem
+      try scoped(effect {
+        const tmpDir = try fs.makeTempDirectoryScoped()
+        const storageLayer = StateStorageFileSystem(tmpDir)
+        provide storageLayer {
+          const storage = try StateStorage
+          try storage.set("snap-a", "0xdeadbeef")
+          const loaded = try storage.get("snap-a")
+          try Effect.try(() => assert.strictEqual(Option.isSome(loaded), true))
+          if (Option.isSome(loaded)) {
+            try Effect.try(() => assert.strictEqual(loaded.value, "0xdeadbeef"))
+          }
+          const keys = try storage.keys()
+          try Effect.try(() => assert.deepStrictEqual(keys, ["snap-a"]))
+
+          const badKeyTag = storage.set("../escape", "0x00") catch (e) => e._tag
+          try Effect.try(() => assert.strictEqual(badKeyTag, "StorageError"))
+        }
+      })
+    }
+  })
+})
+
+describe("Voltaire v2 integration seam", () => {
+  it.effect("injects custom VoltaireAbiCodec and bridges Transport", effect () => {
+    const customVoltaireCodec = VoltaireAbiCodec({
+      encodeFunctionData: () => Effect.succeed("0x12345678"),
+      decodeFunctionResult: () => Effect.succeed(99n),
+      encodeDeployData: (_abi, bytecode) => Effect.succeed(bytecode),
+      decodeEventLog: (_abi, raw) => Effect.succeed({ eventName: "Ping", args: {}, raw }),
+      keccak256: () => Effect.succeed("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    })
+
+    const Stack = Layer.merge(MemoryTevm, customVoltaireCodec)
+    provide Stack {
+      const codec = try AbiCodec
+      const encoded = try codec.encodeFunctionData([], "foo")
+      try Effect.try(() => assert.strictEqual(encoded, "0x12345678"))
+
+      const vt = try toVoltaireTransport()
+      const chainId = try vt.request<string>("eth_chainId")
+      try Effect.try(() => assert.strictEqual(chainId, "0x7a69"))
+    }
+  })
+})

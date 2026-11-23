@@ -1,0 +1,29 @@
+// High-level ergonomic Layer compositions for tevm-effect.
+// Everything remains aggressively injectable: provide `TevmCoreLive` with ANY
+// `Common`, `ZevmBackend`, `StateStorage`, or `AbiCodec` layer!
+
+import { AbiCodecZevm } from "./services/codec.vibe"
+import { EvmLive } from "./services/evm.vibe"
+import { StateStorageMemory } from "./services/storage.vibe"
+import { TransportFromEvm } from "./services/transport.vibe"
+
+/**
+ * Compose `Evm` + `Transport` over any injected `Common` + `ZevmBackend`,
+ * leaving `AbiCodec` and `StateStorage` completely free to be injected separately.
+ */
+export const TevmEngineLayer = Layer.provideMerge(TransportFromEvm, EvmLive)
+
+/**
+ * Full TEVM service stack composed over any injected `Common` + `ZevmBackend`:
+ *   - `Evm` (serialized, scoped, observable execution engine)
+ *   - `Transport` (direct in-process bridge to `Evm`)
+ *   - `AbiCodec` (ZEVM keccak256 static ABI codec — override with `VoltaireAbiCodec`)
+ *   - `StateStorage` (in-memory Ref storage — override with `StateStorageFileSystem`)
+ *
+ * Uses `Layer.provideMerge` so `Evm`, `Transport`, and `AbiCodec` share a single
+ * scoped ZEVM engine instance while keeping `Common` and `ZevmBackend` injectable.
+ */
+export const TevmCoreLive = Layer.merge(
+  Layer.provideMerge(AbiCodecZevm, TevmEngineLayer),
+  StateStorageMemory,
+)

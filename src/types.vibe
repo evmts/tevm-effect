@@ -1,0 +1,359 @@
+// Core domain types aligned 1:1 with the ZEVM JSON-RPC contract.
+// Designed so voltaire-effect v2 branded primitives slot directly in without
+// breaking consumer ergonomics.
+
+export type Hex = `0x${string}`
+export type Address = Hex
+export type Hash32 = Hex
+export type Bytes32 = Hex
+export type QuantityHex = Hex
+
+export type BlockTag = "latest" | "earliest" | "pending" | "safe" | "finalized"
+export type BlockSelector = BlockTag | QuantityHex | bigint | number
+
+export type Hardfork =
+  | "frontier"
+  | "homestead"
+  | "tangerineWhistle"
+  | "spuriousDragon"
+  | "byzantium"
+  | "constantinople"
+  | "petersburg"
+  | "istanbul"
+  | "berlin"
+  | "london"
+  | "paris"
+  | "shanghai"
+  | "cancun"
+  | "prague"
+  | "osaka"
+
+export type JsonPrimitive = string | number | boolean | null
+export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue }
+
+export type JsonRpcId = string | number | null
+
+export interface JsonRpcRequest {
+  readonly jsonrpc: "2.0"
+  readonly id?: JsonRpcId
+  readonly method: string
+  readonly params?: readonly unknown[]
+}
+
+export interface RpcCall {
+  readonly method: string
+  readonly params?: readonly unknown[]
+}
+
+export interface JsonRpcSuccessEnvelope<T = JsonValue> {
+  readonly jsonrpc: "2.0"
+  readonly id: JsonRpcId
+  readonly result: T
+}
+
+export interface JsonRpcErrorEnvelope {
+  readonly jsonrpc: "2.0"
+  readonly id: JsonRpcId
+  readonly error: {
+    readonly code: number
+    readonly message: string
+    readonly data?: unknown
+  }
+}
+
+export type JsonRpcEnvelope<T = JsonValue> = JsonRpcSuccessEnvelope<T> | JsonRpcErrorEnvelope
+
+export interface ForkConfig {
+  readonly url: string
+  readonly blockNumber?: bigint | number
+}
+
+export type MiningMode = "auto" | "manual" | "interval"
+
+export interface MiningConfig {
+  readonly mode: MiningMode
+  readonly intervalSeconds?: number
+}
+
+export interface NativeCurrency {
+  readonly name: string
+  readonly symbol: string
+  readonly decimals: number
+}
+
+export interface ChainSpec {
+  readonly chainId: number
+  readonly name: string
+  readonly hardfork: Hardfork
+  readonly nativeCurrency: NativeCurrency
+  readonly blockTimeMs: number
+  readonly blockGasLimit: bigint
+  readonly testnet: boolean
+  readonly fork?: ForkConfig
+  readonly mining: MiningConfig
+}
+
+export interface AccessListEntry {
+  readonly address: Address
+  readonly storageKeys: readonly Bytes32[]
+}
+
+export interface TransactionRequest {
+  readonly from?: Address
+  readonly to?: Address | null
+  readonly gas?: QuantityHex | bigint | number
+  readonly gasPrice?: QuantityHex | bigint | number
+  readonly maxFeePerGas?: QuantityHex | bigint | number
+  readonly maxPriorityFeePerGas?: QuantityHex | bigint | number
+  readonly maxFeePerBlobGas?: QuantityHex | bigint | number
+  readonly value?: QuantityHex | bigint | number
+  readonly nonce?: QuantityHex | bigint | number
+  readonly data?: Hex
+  readonly input?: Hex
+  readonly chainId?: QuantityHex | bigint | number
+  readonly type?: QuantityHex | number
+  readonly accessList?: readonly AccessListEntry[]
+  readonly blobVersionedHashes?: readonly Hash32[]
+}
+
+export interface StateOverride {
+  readonly balance?: QuantityHex | bigint
+  readonly nonce?: QuantityHex | bigint | number
+  readonly code?: Hex
+  readonly storage?: Readonly<Record<Bytes32, Bytes32>>
+}
+
+export type StateOverrideSet = Readonly<Record<Address, StateOverride>>
+
+export interface TransactionObject {
+  readonly type: QuantityHex
+  readonly hash: Hash32
+  readonly nonce: QuantityHex
+  readonly blockHash: Hash32 | null
+  readonly blockNumber: QuantityHex | null
+  readonly transactionIndex: QuantityHex | null
+  readonly from: Address
+  readonly to: Address | null
+  readonly value: QuantityHex
+  readonly gas: QuantityHex
+  readonly gasPrice?: QuantityHex
+  readonly input: Hex
+}
+
+export interface BlockObject<TFull extends boolean = false> {
+  readonly hash: Hash32
+  readonly parentHash: Hash32
+  readonly sha3Uncles: Hash32
+  readonly miner: Address
+  readonly stateRoot: Hash32
+  readonly transactionsRoot: Hash32
+  readonly receiptsRoot: Hash32
+  readonly logsBloom: Hex
+  readonly number: QuantityHex
+  readonly gasLimit: QuantityHex
+  readonly gasUsed: QuantityHex
+  readonly timestamp: QuantityHex
+  readonly extraData: Hex
+  readonly mixHash: Hash32
+  readonly nonce: Hex
+  readonly size: QuantityHex
+  readonly transactions: TFull extends true ? readonly TransactionObject[] : readonly Hash32[]
+  readonly uncles: readonly Hash32[]
+  readonly difficulty: QuantityHex
+  readonly totalDifficulty: QuantityHex
+  readonly baseFeePerGas?: QuantityHex
+  readonly withdrawalsRoot?: Hash32
+  readonly blobGasUsed?: QuantityHex
+  readonly excessBlobGas?: QuantityHex
+  readonly parentBeaconBlockRoot?: Hash32
+}
+
+export interface LogObject {
+  readonly removed: boolean
+  readonly logIndex: QuantityHex
+  readonly transactionIndex: QuantityHex
+  readonly transactionHash: Hash32
+  readonly blockHash: Hash32
+  readonly blockNumber: QuantityHex
+  readonly address: Address
+  readonly data: Hex
+  readonly topics: readonly Hash32[]
+}
+
+export interface ReceiptObject {
+  readonly transactionHash: Hash32
+  readonly transactionIndex: QuantityHex
+  readonly blockHash: Hash32
+  readonly blockNumber: QuantityHex
+  readonly from: Address
+  readonly to: Address | null
+  readonly cumulativeGasUsed: QuantityHex
+  readonly gasUsed: QuantityHex
+  readonly contractAddress: Address | null
+  readonly logs: readonly LogObject[]
+  readonly logsBloom: Hex
+  readonly status: QuantityHex
+  readonly root: Hash32 | null
+  readonly effectiveGasPrice: QuantityHex
+  readonly type: QuantityHex
+  readonly blobGasUsed: QuantityHex | null
+  readonly blobGasPrice: QuantityHex | null
+}
+
+export type TopicEntry = Hash32 | readonly Hash32[] | null
+
+export interface LogFilter {
+  readonly fromBlock?: BlockSelector
+  readonly toBlock?: BlockSelector
+  readonly blockHash?: Hash32
+  readonly address?: Address | readonly Address[]
+  readonly topics?: readonly TopicEntry[]
+}
+
+export interface FeeHistoryResult {
+  readonly oldestBlock: QuantityHex
+  readonly baseFeePerGas: readonly QuantityHex[]
+  readonly gasUsedRatio: readonly number[]
+  readonly reward?: readonly (readonly QuantityHex[])[]
+}
+
+export interface AccessListResult {
+  readonly accessList: readonly AccessListEntry[]
+  readonly gasUsed: QuantityHex
+}
+
+export interface AccountStateWire {
+  readonly balance: QuantityHex
+  readonly nonce: QuantityHex
+  readonly code: Hex
+  readonly storage: Readonly<Record<Bytes32, Bytes32>>
+}
+
+export interface AccountState {
+  readonly address: Address
+  readonly balance: bigint
+  readonly nonce: bigint
+  readonly code: Hex
+  readonly storage: Readonly<Record<Bytes32, Bytes32>>
+}
+
+export interface StateDump {
+  readonly version: 1
+  readonly accounts: Readonly<Record<Address, AccountStateWire>>
+}
+
+export interface MinedBlockSummary {
+  readonly number: QuantityHex
+  readonly hash: Hash32
+  readonly timestamp: QuantityHex
+}
+
+export interface NodeMetadata {
+  readonly mode: "trusted" | "light"
+  readonly chainId: QuantityHex
+  readonly forking: boolean
+  readonly forkUrl: string | null
+  readonly forkBlockNumber: QuantityHex | null
+}
+
+export interface NodeMiningInfo {
+  readonly type: MiningMode
+  readonly blockTime: QuantityHex | null
+}
+
+export interface NodeForkInfo {
+  readonly enabled: boolean
+  readonly url: string | null
+  readonly blockNumber: QuantityHex | null
+}
+
+export interface NodeInfo {
+  readonly chainId: QuantityHex
+  readonly coinbase: Address
+  readonly blockNumber: QuantityHex
+  readonly managedAccounts: readonly Address[]
+  readonly mining: NodeMiningInfo
+  readonly fork: NodeForkInfo
+}
+
+export interface LightSyncStatus {
+  readonly ready: boolean
+  readonly status: "syncing" | "synced" | "error"
+  readonly network: "mainnet" | "sepolia" | "holesky" | "hoodi"
+  readonly checkpointSource: "explicit" | "persisted" | "default"
+  readonly lastCheckpoint: Hash32
+  readonly optimisticSlot: QuantityHex
+  readonly safeSlot: QuantityHex
+  readonly finalizedSlot: QuantityHex
+}
+
+export interface TraceOptions {
+  readonly disableStack?: boolean
+  readonly enableMemory?: boolean
+  readonly enableReturnData?: boolean
+  readonly disableStorage?: boolean
+}
+
+export interface StructLog {
+  readonly pc: number
+  readonly op: string
+  readonly gas: number
+  readonly gasCost: number
+  readonly depth: number
+  readonly stack?: readonly Hex[]
+  readonly memory?: readonly Hex[]
+  readonly returnData?: Hex
+}
+
+export interface TraceResult {
+  readonly gas: number
+  readonly failed: boolean
+  readonly returnValue: Hex
+  readonly structLogs: readonly StructLog[]
+  readonly truncated?: boolean
+}
+
+export interface TxPoolStatus {
+  readonly pending: QuantityHex
+  readonly queued: QuantityHex
+}
+
+export interface TxPoolContent {
+  readonly pending: Readonly<Record<Address, Readonly<Record<string, TransactionObject>>>>
+  readonly queued: Readonly<Record<Address, Readonly<Record<string, TransactionObject>>>>
+}
+
+export interface CallParams extends TransactionRequest {
+  readonly blockTag?: BlockSelector
+  readonly stateOverride?: StateOverrideSet
+  readonly addToMempool?: boolean
+  readonly addToBlockchain?: boolean
+}
+
+export interface CallResult {
+  readonly rawData: Hex
+  readonly txHash?: Hash32
+  readonly receipt?: ReceiptObject | null
+}
+
+export interface SetAccountParams {
+  readonly address: Address
+  readonly balance?: bigint | QuantityHex
+  readonly nonce?: bigint | number | QuantityHex
+  readonly code?: Hex
+  readonly storage?: Readonly<Record<Bytes32, Bytes32>>
+}
+
+export interface MineParams {
+  readonly blocks?: number | bigint
+  readonly intervalSeconds?: number | bigint
+}
+
+export type AbiItem = Readonly<Record<string, unknown>>
+export type Abi = readonly AbiItem[]
+
+export interface DecodedEventLog {
+  readonly eventName: string
+  readonly args: Readonly<Record<string, unknown>>
+  readonly raw: LogObject
+}

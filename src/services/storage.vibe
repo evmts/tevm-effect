@@ -1,0 +1,169 @@
+// StateStorage service: dependency-injected persistence layer for ZEVM state dumps
+// and named checkpoints. Completely decoupled from Node fs or browser storage —
+// ships with an in-memory Effect Ref layer and a platform-agnostic Effect FileSystem layer.
+
+import { StorageError } from "../errors.vibe"
+import type { Hex } from "../types.vibe"
+
+export service StateStorage {
+  static readonly key = "@tevm/effect/StateStorage"
+  readonly get: (key: string) => Option.Option<Hex>!StorageError
+  readonly set: (key: string, stateBlob: Hex) => void!StorageError
+  readonly remove: (key: string) => void!StorageError
+  readonly keys: () => (readonly string[])!StorageError
+}
+
+/** Pure in-memory StateStorage backed by an Effect Ref. Runs on every JS runtime. */
+export const StateStorageMemory = Layer.effect(
+  StateStorage,
+  effect {
+    const store = try Ref.make(new Map<string, Hex>())
+    return {
+      effect get(key: string) {
+        const current = try Ref.get(store)
+        const value = current.get(key)
+        return value === undefined ? Option.none<Hex>() : Option.some(value)
+      },
+      effect set(key: string, stateBlob: Hex) {
+        try Ref.update(store, (map) => {
+          const next = new Map(map)
+          next.set(key, stateBlob)
+          return next
+        })
+      },
+      effect remove(key: string) {
+        try Ref.update(store, (map) => {
+          const next = new Map(map)
+          next.delete(key)
+          return next
+        })
+      },
+      effect keys() {
+        const current = try Ref.get(store)
+        return Array.from(current.keys()).sort()
+      },
+    }
+  },
+)
+
+/** Validate a storage key so file paths cannot escape the configured directory. */
+effect function validateStorageKey(key: string): string!StorageError {
+  if (key.length === 0 || !/^[a-zA-Z0-9._-]+$/.test(key) || key === "." || key === "..") {
+    throw new StorageError({
+      operation: "validateKey",
+      key,
+      message: `Invalid storage key "${key}": use only [a-zA-Z0-9._-]`,
+    })
+  }
+  return key
+}
+
+/**
+ * Platform-agnostic FileSystem-backed StateStorage Layer.
+ * Depends on Effect's `FileSystem.FileSystem` and `Path.Path` services, so it works
+ * on Node, Bun, Deno, or an in-memory mock FileSystem in tests.
+ */
+export function StateStorageFileSystem(directory: string) {
+  return Layer.effect(
+    StateStorage,
+    effect {
+      const fs = try FileSystem.FileSystem
+      const path = try Path.Path
+      try Effect.mapError(
+        fs.makeDirectory(directory, { recursive: true }),
+        (cause) =>
+          new StorageError({
+            operation: "init",
+            message: `Failed to ensure storage directory "${directory}"`,
+            cause,
+          }),
+      )
+      return {
+        effect get(key: string) {
+          const safeKey = try validateStorageKey(key)
+          const filePath = path.join(directory, `${safeKey}.state.hex`)
+          const exists = try Effect.mapError(
+            fs.exists(filePath),
+            (cause) =>
+              new StorageError({
+                operation: "get",
+                key,
+                message: `Failed to check existence of "${filePath}"`,
+                cause,
+              }),
+          )
+          if (!exists) return Option.none<Hex>()
+          const content = try Effect.mapError(
+            fs.readFileString(filePath),
+            (cause) =>
+              new StorageError({
+                operation: "get",
+                key,
+                message: `Failed to read state "${key}"`,
+                cause,
+              }),
+          )
+          return Option.some(content.trim() as Hex)
+        },
+        effect set(key: string, stateBlob: Hex) {
+          const safeKey = try validateStorageKey(key)
+          const filePath = path.join(directory, `${safeKey}.state.hex`)
+          try Effect.mapError(
+            fs.writeFileString(filePath, stateBlob),
+            (cause) =>
+              new StorageError({
+                operation: "set",
+                key,
+                message: `Failed to write state "${key}"`,
+                cause,
+              }),
+          )
+        },
+        effect remove(key: string) {
+          const safeKey = try validateStorageKey(key)
+          const filePath = path.join(directory, `${safeKey}.state.hex`)
+          const exists = try Effect.mapError(
+            fs.exists(filePath),
+            (cause) =>
+              new StorageError({
+                operation: "remove",
+                key,
+                message: `Failed to check existence of "${filePath}"`,
+                cause,
+              }),
+          )
+          if (!exists) return
+          try Effect.mapError(
+            fs.remove(filePath),
+            (cause) =>
+              new StorageError({
+                operation: "remove",
+                key,
+                message: `Failed to remove state "${key}"`,
+                cause,
+              }),
+          )
+        },
+        effect keys() {
+          const entries = try Effect.mapError(
+            fs.readDirectory(directory),
+            (cause) =>
+              new StorageError({
+                operation: "keys",
+                message: `Failed to list directory "${directory}"`,
+                cause,
+              }),
+          )
+          const result: string[] = []
+          for (const name of entries) {
+            if (name.endsWith(".state.hex")) {
+              result.push(name.slice(0, -".state.hex".length))
+            }
+          }
+          result.sort()
+          return result
+        },
+      }
+    },
+  )
+}

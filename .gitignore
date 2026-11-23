@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.vibe/
+coverage/
+*.tsbuildinfo
+.DS_Store

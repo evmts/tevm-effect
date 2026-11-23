@@ -1,0 +1,263 @@
+// Typed Effect error hierarchy for tevm-effect.
+// Every failure mode is an explicit, matchable tagged error covering ZEVM native
+// bindings, JSON-RPC 2.0 wire errors, runtime modes, transport, storage, and codec.
+
+export error ZevmBindingError {
+  reason: string
+  cause?: unknown
+}
+
+export error NodeClosedError {
+  operation: string
+}
+
+export error InvalidConfigError {
+  field: string
+  value: unknown
+  reason: string
+}
+
+export error JsonRpcParseError {
+  message: string
+  raw?: string
+}
+
+export error JsonRpcInvalidRequestError {
+  message: string
+  data?: unknown
+}
+
+export error JsonRpcMethodNotFoundError {
+  method: string
+  message: string
+}
+
+export error JsonRpcInvalidParamsError {
+  method: string
+  message: string
+  data?: unknown
+}
+
+export error JsonRpcInternalError {
+  method: string
+  message: string
+  code: number
+  data?: unknown
+}
+
+export error ExecutionRevertedError {
+  method: string
+  message: string
+  data?: string
+}
+
+export error ModeUnsupportedError {
+  method: string
+  message: string
+}
+
+export error LightNotReadyError {
+  method: string
+  message: string
+}
+
+export error ProofVerificationError {
+  method: string
+  message: string
+}
+
+export error MalformedUpstreamProofError {
+  method: string
+  message: string
+}
+
+export error GasCapExceededError {
+  method: string
+  message: string
+}
+
+export error TransportError {
+  transport: string
+  method?: string
+  code?: number
+  statusCode?: number
+  message: string
+  data?: unknown
+  cause?: unknown
+}
+
+export error StorageError {
+  operation: string
+  key?: string
+  message: string
+  cause?: unknown
+}
+
+export error CodecError {
+  operation: string
+  message: string
+  cause?: unknown
+}
+
+export error SnapshotNotFoundError {
+  snapshotId: string
+}
+
+export error TransactionNotFoundError {
+  txHash: string
+}
+
+export error BlockNotFoundError {
+  selector: string
+}
+
+export error ReceiptTimeoutError {
+  txHash: string
+  message: string
+}
+
+/** Union of all structured JSON-RPC errors returned by ZEVM or a remote Ethereum node. */
+export type RpcError =
+  | JsonRpcParseError
+  | JsonRpcInvalidRequestError
+  | JsonRpcMethodNotFoundError
+  | JsonRpcInvalidParamsError
+  | JsonRpcInternalError
+  | ExecutionRevertedError
+  | ModeUnsupportedError
+  | LightNotReadyError
+  | ProofVerificationError
+  | MalformedUpstreamProofError
+  | GasCapExceededError
+
+/** Complete union of domain errors produced across tevm-effect. */
+export type TevmError =
+  | ZevmBindingError
+  | NodeClosedError
+  | InvalidConfigError
+  | RpcError
+  | TransportError
+  | StorageError
+  | CodecError
+  | SnapshotNotFoundError
+  | TransactionNotFoundError
+  | BlockNotFoundError
+  | ReceiptTimeoutError
+
+export interface RawJsonRpcError {
+  readonly code: number
+  readonly message: string
+  readonly data?: unknown
+}
+
+/**
+ * Map a raw JSON-RPC 2.0 error object from ZEVM (or an upstream node) into the
+ * exact typed Effect error matching the ZEVM JSON-RPC contract.
+ */
+export function classifyRpcError(method: string, payload: RawJsonRpcError): RpcError {
+  const { code, message, data } = payload
+  if (code === -32700) {
+    return new JsonRpcParseError({ message })
+  }
+  if (code === -32600) {
+    return new JsonRpcInvalidRequestError({ message, data })
+  }
+  if (code === -32601) {
+    return new JsonRpcMethodNotFoundError({ method, message })
+  }
+  if (code === -32602) {
+    return new JsonRpcInvalidParamsError({ method, message, data })
+  }
+  if (code === -32010) {
+    return new ModeUnsupportedError({ method, message })
+  }
+  if (code === -32011) {
+    return new LightNotReadyError({ method, message })
+  }
+  if (code === -32014) {
+    return new ProofVerificationError({ method, message })
+  }
+  if (code === -32015) {
+    return new MalformedUpstreamProofError({ method, message })
+  }
+  if (code === -32000 && message.toLowerCase().includes("gas limit")) {
+    return new GasCapExceededError({ method, message })
+  }
+  if (code === 3 || message.toLowerCase().includes("revert")) {
+    return new ExecutionRevertedError({
+      method,
+      message,
+      data: typeof data === "string" ? data : undefined,
+    })
+  }
+  return new JsonRpcInternalError({ method, code, message, data })
+}
+
+/** Convert any RpcError or engine error into a TransportError while preserving code & cause. */
+export function toTransportError(transport: string, method: string | undefined, err: unknown): TransportError {
+  if (err instanceof TransportError) {
+    return err
+  }
+  if (err instanceof JsonRpcParseError) {
+    return new TransportError({ transport, method, code: -32700, message: err.message, cause: err })
+  }
+  if (err instanceof JsonRpcInvalidRequestError) {
+    return new TransportError({ transport, method, code: -32600, message: err.message, data: err.data, cause: err })
+  }
+  if (err instanceof JsonRpcMethodNotFoundError) {
+    return new TransportError({ transport, method: err.method, code: -32601, message: err.message, cause: err })
+  }
+  if (err instanceof JsonRpcInvalidParamsError) {
+    return new TransportError({
+      transport,
+      method: err.method,
+      code: -32602,
+      message: err.message,
+      data: err.data,
+      cause: err,
+    })
+  }
+  if (err instanceof ModeUnsupportedError) {
+    return new TransportError({ transport, method: err.method, code: -32010, message: err.message, cause: err })
+  }
+  if (err instanceof LightNotReadyError) {
+    return new TransportError({ transport, method: err.method, code: -32011, message: err.message, cause: err })
+  }
+  if (err instanceof ProofVerificationError) {
+    return new TransportError({ transport, method: err.method, code: -32014, message: err.message, cause: err })
+  }
+  if (err instanceof MalformedUpstreamProofError) {
+    return new TransportError({ transport, method: err.method, code: -32015, message: err.message, cause: err })
+  }
+  if (err instanceof GasCapExceededError) {
+    return new TransportError({ transport, method: err.method, code: -32000, message: err.message, cause: err })
+  }
+  if (err instanceof ExecutionRevertedError) {
+    return new TransportError({
+      transport,
+      method: err.method,
+      code: 3,
+      message: err.message,
+      data: err.data,
+      cause: err,
+    })
+  }
+  if (err instanceof JsonRpcInternalError) {
+    return new TransportError({
+      transport,
+      method: err.method,
+      code: err.code,
+      message: err.message,
+      data: err.data,
+      cause: err,
+    })
+  }
+  if (err instanceof NodeClosedError) {
+    return new TransportError({ transport, method, message: `Node is closed during ${err.operation}`, cause: err })
+  }
+  if (err instanceof ZevmBindingError) {
+    return new TransportError({ transport, method, message: err.reason, cause: err })
+  }
+  const msg = err instanceof Error ? err.message : String(err)
+  return new TransportError({ transport, method, message: msg, cause: err })
+}

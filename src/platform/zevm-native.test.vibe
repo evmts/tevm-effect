@@ -1,0 +1,139 @@
+import { assert, describe, it } from "@effect/vitest"
+import {
+  AnvilCommon,
+  blockStream,
+  debugTraceCall,
+  ethCall,
+  getAccounts,
+  getBalance,
+  getBlockNumber,
+  getChainId,
+  getCode,
+  getStorageAt,
+  restoreStateFromStorage,
+  saveStateToStorage,
+  sendTransaction,
+  sha3,
+  tevmGetAccount,
+  tevmMetadata,
+  tevmMineDetailed,
+  tevmNodeInfo,
+  tevmSetAccount,
+  tevmSetBalance,
+  TevmCoreLive,
+  withChainId,
+  withImpersonation,
+  withSnapshot,
+} from "../index.vibe"
+import { ZevmBackendNode } from "./node.vibe"
+import { findLocalZevmModulePath } from "./locate-zevm.ts"
+
+const zevmModulePath = findLocalZevmModulePath()
+
+describe.skipIf(zevmModulePath === undefined)("Real Native ZEVM Integration (Node-API Zig Binary)", () => {
+  const NativeTevm = Layer.provideMerge(
+    TevmCoreLive,
+    Layer.merge(
+      Layer.provide(withChainId(31337), AnvilCommon),
+      ZevmBackendNode({ modulePath: zevmModulePath }),
+    ),
+  )
+
+  it.effect("runs real EVM bytecode, state mutations, scoped snapshots, traces, and block streams on native ZEVM", effect () => {
+    provide NativeTevm {
+      // 1. Chain & node metadata directly from Zig NodeRuntime
+      const chainId = try getChainId()
+      try Effect.try(() => assert.strictEqual(chainId, 31337n))
+      const meta = try tevmMetadata()
+      try Effect.try(() => assert.strictEqual(meta.mode, "trusted"))
+      const info = try tevmNodeInfo()
+      try Effect.try(() => assert.strictEqual(info.managedAccounts.length, 10))
+
+      // 2. Real Keccak-256 via ZEVM web3_sha3
+      const emptyHash = try sha3("0x")
+      try Effect.try(() =>
+        assert.strictEqual(
+          emptyHash,
+          "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+        )
+      )
+
+      // 3. Install real EVM runtime bytecode: PUSH1 0x2a PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 RETURN
+      const contractAddr = "0x000000000000000000000000000000000000c0de" as const
+      const bytecode = "0x602a60005260206000f3" as const
+      const slot0 = "0x0000000000000000000000000000000000000000000000000000000000000000" as const
+      const slotVal = "0x0000000000000000000000000000000000000000000000000000000000000007" as const
+
+      try tevmSetAccount({
+        address: contractAddr,
+        balance: 1_000_000n,
+        code: bytecode,
+        storage: { [slot0]: slotVal },
+      })
+
+      const storedCode = try getCode(contractAddr)
+      const storedSlot = try getStorageAt(contractAddr, slot0)
+      try Effect.try(() => assert.strictEqual(storedCode, bytecode))
+      try Effect.try(() => assert.strictEqual(storedSlot, slotVal))
+
+      // Real Guillotine Mini EVM execution returns 32-byte word 0x...002a (42)!
+      const callOut = try ethCall({ to: contractAddr })
+      try Effect.try(() =>
+        assert.strictEqual(
+          callOut,
+          "0x000000000000000000000000000000000000000000000000000000000000002a",
+        )
+      )
+
+      // 4. Real opcode-level trace via debug_traceCall
+      const trace = try debugTraceCall({ to: contractAddr })
+      try Effect.try(() => assert.strictEqual(trace.failed, false))
+      try Effect.try(() => assert.strictEqual(trace.structLogs.length > 0, true))
+
+      // 5. Effect-scoped snapshot rolls back real native Zig state automatically
+      const watched = "0x000000000000000000000000000000000000feed" as const
+      try tevmSetBalance(watched, 1234n)
+      try withSnapshot(
+        effect {
+          try tevmSetBalance(watched, 999_999n)
+          const insideBal = try getBalance(watched)
+          try Effect.try(() => assert.strictEqual(insideBal, 999_999n))
+        },
+      )
+      const revertedBal = try getBalance(watched)
+      try Effect.try(() => assert.strictEqual(revertedBal, 1234n))
+
+      // 6. Save & restore real ZEVM state blob through injected StateStorage
+      try saveStateToStorage("native-snap")
+      try tevmSetBalance(watched, 1n)
+      const mutatedBal = try getBalance(watched)
+      try Effect.try(() => assert.strictEqual(mutatedBal, 1n))
+      const ok = try restoreStateFromStorage("native-snap")
+      try Effect.try(() => assert.strictEqual(ok, true))
+      const acc = try tevmGetAccount(watched)
+      try Effect.try(() => assert.strictEqual(acc.balance, 1234n))
+
+      // 7. Scoped impersonation & real transaction mining
+      const accounts = try getAccounts()
+      try withImpersonation(
+        watched,
+        effect {
+          try tevmSetBalance(watched, 10n ** 18n)
+          const txHash = try sendTransaction({
+            from: watched,
+            to: accounts[1],
+            value: 500n,
+          })
+          try Effect.try(() => assert.strictEqual(txHash.startsWith("0x"), true))
+        },
+      )
+
+      // 8. Real mining + Effect blockStream backfill
+      const mined = try tevmMineDetailed({ blocks: 2 })
+      try Effect.try(() => assert.strictEqual(mined.length, 2))
+      const head = try getBlockNumber()
+      const blocks = try Stream.runCollect(blockStream({ fromBlock: 0n, toBlock: head }))
+      try Effect.try(() => assert.strictEqual(BigInt(blocks.length), head + 1n))
+    }
+  })
+})

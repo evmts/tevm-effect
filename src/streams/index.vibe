@@ -1,0 +1,230 @@
+// Effect Streams as first-class blockchain data structures.
+// Backpressure-aware, composable, fiber-interruptible, and TestClock-friendly.
+// Every stream depends ONLY on injected services (`Transport`, optionally `AbiCodec`).
+
+import { getBalance, getBlockByNumber, getBlockNumber, getLogs, waitForTransactionReceipt } from "../actions/eth.vibe"
+import { tevmDumpStateDecoded } from "../actions/tevm.vibe"
+import { CodecError, JsonRpcParseError, ReceiptTimeoutError, TransportError } from "../errors.vibe"
+import { parseQuantityHex } from "../hex.vibe"
+import { AbiCodec } from "../services/codec.vibe"
+import { Transport } from "../services/transport.vibe"
+import type {
+  AccountStateWire,
+  Address,
+  BlockObject,
+  DecodedEventLog,
+  Hash32,
+  LogFilter,
+  LogObject,
+  ReceiptObject,
+  TransactionObject,
+} from "../types.vibe"
+
+export interface BlockStreamOptions<TFull extends boolean = false> {
+  /** Starting block number to backfill from. Defaults to current head + 1 (or current head if emitCurrent is true). */
+  readonly fromBlock?: bigint
+  /** Inclusive upper block number bound. Omit for an infinite live stream. */
+  readonly toBlock?: bigint
+  /** Emit full transaction objects instead of transaction hashes. */
+  readonly includeTransactions?: TFull
+  /** Emit the starting head block immediately when `fromBlock` is omitted. */
+  readonly emitCurrent?: boolean
+  /** Polling cadence for new blocks (driven by Effect Clock). */
+  readonly pollInterval?: Duration.Input
+}
+
+/**
+ * Effect Stream of canonical blocks — supports bounded historical backfill,
+ * live watching, or seamless backfill-into-live tailing.
+ */
+export function blockStream<TFull extends boolean = false>(
+  options: BlockStreamOptions<TFull> = {},
+): Stream.Stream<BlockObject<TFull>, TransportError | CodecError, Transport> {
+  const pollInterval = options.pollInterval ?? "100 millis"
+  const fullTx = options.includeTransactions ?? (false as TFull)
+
+  effect function* produce() {
+    let head = try getBlockNumber()
+    let cursor = options.fromBlock ?? (options.emitCurrent ? head : head + 1n)
+
+    while (true) {
+      const target = options.toBlock !== undefined && options.toBlock < head ? options.toBlock : head
+      while (cursor <= target) {
+        const block = try getBlockByNumber<TFull>(cursor, fullTx)
+        if (block !== null) {
+          yield block
+        }
+        cursor = cursor + 1n
+      }
+      if (options.toBlock !== undefined && cursor > options.toBlock) {
+        return
+      }
+      try sleep(pollInterval)
+      head = try getBlockNumber()
+    }
+  }
+
+  return produce()
+}
+
+export interface TransactionStreamOptions {
+  readonly fromBlock?: bigint
+  readonly toBlock?: bigint
+  readonly emitCurrent?: boolean
+  readonly pollInterval?: Duration.Input
+}
+
+/** Effect Stream of mined `TransactionObject`s extracted from `blockStream` with backpressure. */
+export function transactionStream(
+  options: TransactionStreamOptions = {},
+): Stream.Stream<TransactionObject, TransportError | CodecError, Transport> {
+  return blockStream<true>({
+    fromBlock: options.fromBlock,
+    toBlock: options.toBlock,
+    emitCurrent: options.emitCurrent,
+    pollInterval: options.pollInterval,
+    includeTransactions: true,
+  }).pipe(Stream.flatMap((block) => Stream.fromIterable(block.transactions)))
+}
+
+export interface LogStreamOptions {
+  readonly fromBlock?: bigint
+  readonly toBlock?: bigint
+  /** Max blocks per `eth_getLogs` chunk during backfill. Defaults to 1000n. */
+  readonly chunkSize?: bigint
+  readonly pollInterval?: Duration.Input
+}
+
+/**
+ * Effect Stream of Ethereum event logs matching `filter`.
+ * Automatically chunks historical backfill ranges and transitions smoothly into live watching.
+ */
+export function logStream(
+  filter: Omit<LogFilter, "fromBlock" | "toBlock" | "blockHash"> = {},
+  options: LogStreamOptions = {},
+): Stream.Stream<LogObject, TransportError | CodecError, Transport> {
+  const pollInterval = options.pollInterval ?? "100 millis"
+  const chunkSize = options.chunkSize !== undefined && options.chunkSize > 0n ? options.chunkSize : 1000n
+
+  effect function* produce() {
+    let head = try getBlockNumber()
+    let cursor = options.fromBlock ?? head
+
+    while (true) {
+      const upper = options.toBlock !== undefined && options.toBlock < head ? options.toBlock : head
+      while (cursor <= upper) {
+        const chunkEnd = cursor + chunkSize - 1n < upper ? cursor + chunkSize - 1n : upper
+        const logs = try getLogs({
+          ...filter,
+          fromBlock: cursor,
+          toBlock: chunkEnd,
+        })
+        for (const entry of logs) {
+          yield entry
+        }
+        cursor = chunkEnd + 1n
+      }
+      if (options.toBlock !== undefined && cursor > options.toBlock) {
+        return
+      }
+      try sleep(pollInterval)
+      head = try getBlockNumber()
+    }
+  }
+
+  return produce()
+}
+
+/** Effect Stream of decoded contract events, piping `logStream` through the injected `AbiCodec`. */
+export function contractEventStream(
+  abi: readonly Readonly<Record<string, unknown>>[],
+  filter: Omit<LogFilter, "fromBlock" | "toBlock" | "blockHash"> = {},
+  options: LogStreamOptions = {},
+): Stream.Stream<DecodedEventLog, TransportError | CodecError, Transport | AbiCodec> {
+  return logStream(filter, options).pipe(
+    Stream.mapEffect(effect (log) => {
+      const codec = try AbiCodec
+      return (codec.decodeEventLog(abi, log)) catch () => null
+    }),
+    Stream.filter((decoded): decoded is DecodedEventLog => decoded !== null),
+  )
+}
+
+export interface ReceiptStreamOptions {
+  readonly concurrency?: number
+  readonly pollInterval?: Duration.Input
+  readonly maxAttempts?: number
+}
+
+/** Concurrently resolve a stream or iterable of transaction hashes into their mined `ReceiptObject`s. */
+export function receiptStream(
+  txHashes: Iterable<Hash32>,
+  options: ReceiptStreamOptions = {},
+): Stream.Stream<ReceiptObject, TransportError | ReceiptTimeoutError, Transport> {
+  const concurrency = options.concurrency ?? 4
+  return Stream.fromIterable(txHashes).pipe(
+    Stream.mapEffect(
+      (hash) =>
+        waitForTransactionReceipt(hash, {
+          pollInterval: options.pollInterval,
+          maxAttempts: options.maxAttempts,
+        }),
+      { concurrency },
+    ),
+  )
+}
+
+export interface BalanceChange {
+  readonly blockNumber: bigint
+  readonly balance: bigint
+}
+
+/**
+ * Reactive Effect Stream emitting `{ blockNumber, balance }` ONLY when an account's
+ * balance actually changes across blocks (uses `Stream.changesWith`).
+ */
+export function accountBalanceStream(
+  address: Address,
+  options: {
+    readonly fromBlock?: bigint
+    readonly toBlock?: bigint
+    readonly pollInterval?: Duration.Input
+  } = {},
+): Stream.Stream<BalanceChange, TransportError | CodecError, Transport> {
+  return blockStream<false>({
+    fromBlock: options.fromBlock,
+    toBlock: options.toBlock,
+    emitCurrent: true,
+    pollInterval: options.pollInterval,
+  }).pipe(
+    Stream.mapEffect(effect (block) => {
+      const blockNumber = try parseQuantityHex(block.number)
+      const balance = try getBalance(address, "latest")
+      return { blockNumber, balance }
+    }),
+    Stream.changesWith((a, b) => a.balance === b.balance),
+  )
+}
+
+export interface StateAccountEntry {
+  readonly address: Address
+  readonly account: AccountStateWire
+}
+
+/** Stream all accounts from the current ZEVM state dump (`zevm_dumpState`). */
+export function stateAccountStream(): Stream.Stream<
+  StateAccountEntry,
+  TransportError | CodecError | JsonRpcParseError,
+  Transport
+> {
+  return Stream.unwrap(
+    effect {
+      const dump = try tevmDumpStateDecoded()
+      const entries: StateAccountEntry[] = Object.entries(dump.accounts).map(([address, account]) => ({
+        address: address as Address,
+        account,
+      }))
+      return Stream.fromIterable(entries)
+    },
+  )
+}

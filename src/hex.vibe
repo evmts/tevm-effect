@@ -1,0 +1,139 @@
+// Pure hex, quantity, selector, and JSON wire formatting helpers.
+// Built without external dependencies so core stays platform-agnostic and
+// zero-dependency until voltaire-effect v2 primitives plug in.
+
+import { CodecError, JsonRpcParseError } from "./errors.vibe"
+import type { BlockSelector, Hex, QuantityHex, StateOverrideSet, TransactionRequest } from "./types.vibe"
+
+/** Format a non-negative bigint or safe integer as canonical Ethereum QuantityHex. */
+export function toQuantityHex(value: bigint | number | QuantityHex): QuantityHex {
+  if (typeof value === "string") {
+    return value
+  }
+  if (typeof value === "bigint") {
+    const n = value < 0n ? 0n : value
+    return `0x${n.toString(16)}` as QuantityHex
+  }
+  const n = Number.isFinite(value) && value > 0 ? Math.trunc(value) : 0
+  return `0x${n.toString(16)}` as QuantityHex
+}
+
+/** Parse a QuantityHex string into a bigint inside Effect with typed CodecError. */
+export effect function parseQuantityHex(hex: string): bigint!CodecError {
+  if (!/^0x[0-9a-fA-F]+$/.test(hex)) {
+    throw new CodecError({
+      operation: "parseQuantityHex",
+      message: `Invalid quantity hex string: "${hex}"`,
+    })
+  }
+  return try Effect.try({
+    try: () => BigInt(hex),
+    catch: (cause) =>
+      new CodecError({
+        operation: "parseQuantityHex",
+        message: `Failed to parse quantity hex: "${hex}"`,
+        cause,
+      }),
+  })
+}
+
+/** Normalize a BlockSelector (tag, bigint, number, or QuantityHex) to its wire string. */
+export function formatBlockSelector(selector?: BlockSelector): string {
+  if (selector === undefined) return "latest"
+  if (typeof selector === "string") return selector
+  return toQuantityHex(selector)
+}
+
+/** Serialize a TransactionRequest into canonical ZEVM wire format (all quantities as QuantityHex). */
+export function formatTransactionRequest(tx: TransactionRequest): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  if (tx.from !== undefined) out["from"] = tx.from
+  if (tx.to !== undefined) out["to"] = tx.to
+  if (tx.gas !== undefined) out["gas"] = toQuantityHex(tx.gas)
+  if (tx.gasPrice !== undefined) out["gasPrice"] = toQuantityHex(tx.gasPrice)
+  if (tx.maxFeePerGas !== undefined) out["maxFeePerGas"] = toQuantityHex(tx.maxFeePerGas)
+  if (tx.maxPriorityFeePerGas !== undefined) out["maxPriorityFeePerGas"] = toQuantityHex(tx.maxPriorityFeePerGas)
+  if (tx.maxFeePerBlobGas !== undefined) out["maxFeePerBlobGas"] = toQuantityHex(tx.maxFeePerBlobGas)
+  if (tx.value !== undefined) out["value"] = toQuantityHex(tx.value)
+  if (tx.nonce !== undefined) out["nonce"] = toQuantityHex(tx.nonce)
+  if (tx.data !== undefined) out["data"] = tx.data
+  if (tx.input !== undefined) out["input"] = tx.input
+  if (tx.chainId !== undefined) out["chainId"] = toQuantityHex(tx.chainId)
+  if (tx.type !== undefined) out["type"] = toQuantityHex(tx.type)
+  if (tx.accessList !== undefined) out["accessList"] = tx.accessList
+  if (tx.blobVersionedHashes !== undefined) out["blobVersionedHashes"] = tx.blobVersionedHashes
+  return out
+}
+
+/** Serialize a StateOverrideSet into canonical ZEVM wire format. */
+export function formatStateOverrideSet(overrides: StateOverrideSet): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const [address, entry] of Object.entries(overrides)) {
+    const formatted: Record<string, unknown> = {}
+    if (entry.balance !== undefined) formatted["balance"] = toQuantityHex(entry.balance)
+    if (entry.nonce !== undefined) formatted["nonce"] = toQuantityHex(entry.nonce)
+    if (entry.code !== undefined) formatted["code"] = entry.code
+    if (entry.storage !== undefined) formatted["storage"] = entry.storage
+    out[address] = formatted
+  }
+  return out
+}
+
+/** Encode UTF-8 string into 0x-prefixed Hex using platform-agnostic TextEncoder. */
+export function utf8ToHex(text: string): Hex {
+  const bytes = new TextEncoder().encode(text)
+  let out = "0x"
+  for (const byte of bytes) {
+    out += byte.toString(16).padStart(2, "0")
+  }
+  return out as Hex
+}
+
+/** Decode 0x-prefixed Hex into UTF-8 string using platform-agnostic TextDecoder. */
+export effect function hexToUtf8(hex: Hex): string!CodecError {
+  const body = hex.startsWith("0x") ? hex.slice(2) : hex
+  if (body.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(body)) {
+    throw new CodecError({
+      operation: "hexToUtf8",
+      message: `Invalid hex byte string of length ${body.length}`,
+    })
+  }
+  const bytes = new Uint8Array(body.length / 2)
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = Number.parseInt(body.slice(i * 2, i * 2 + 2), 16)
+  }
+  return try Effect.try({
+    try: () => new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    catch: (cause) =>
+      new CodecError({
+        operation: "hexToUtf8",
+        message: "Decoded bytes are not valid UTF-8",
+        cause,
+      }),
+  })
+}
+
+/** Parse a JSON string inside Effect, failing with JsonRpcParseError. */
+export effect function parseJson(raw: string): unknown!JsonRpcParseError {
+  return try Effect.try({
+    try: () => JSON.parse(raw) as unknown,
+    catch: (cause) =>
+      new JsonRpcParseError({
+        message: cause instanceof Error ? cause.message : "Failed to parse JSON",
+        raw,
+      }),
+  })
+}
+
+/** Safely serialize a value to JSON inside Effect, failing with CodecError. */
+export effect function stringifyJson(value: unknown): string!CodecError {
+  return try Effect.try({
+    try: () => JSON.stringify(value),
+    catch: (cause) =>
+      new CodecError({
+        operation: "stringifyJson",
+        message: cause instanceof Error ? cause.message : "Failed to stringify JSON",
+        cause,
+      }),
+  })
+}

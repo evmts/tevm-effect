@@ -1,0 +1,41 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "rootDir": "src",
+    "rootDirs": [
+      "src",
+      ".vibe/declarations"
+    ],
+    "outDir": "dist",
+    "noEmitOnError": true,
+    "rewriteRelativeImportExtensions": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "diagnosticSeverity": {
+          "unstableApiUsage": "off"
+        }
+      }
+    ]
+  },
+  "include": [
+    "src"
+  ],
+  "exclude": [
+    "src/**/*.test.vibe",
+    "src/**/*.test.vibex",
+    "src/**/*.test.ts"
+  ],
+  "vibe": {
+    "severities": {},
+    "sidecarDir": ".vibe/declarations"
+  }
+}

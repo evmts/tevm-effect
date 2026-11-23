@@ -1,0 +1,54 @@
+// ZevmBackend service: platform-agnostic low-level engine & light-client boundary.
+// Core tevm-effect NEVER touches Node-API, FFI, WASM, or HTTP directly.
+// Swap the ZevmBackend Layer to run on Node-API (@evmts/zevm), Bun, WASM,
+// remote HTTP ZEVM, or pure in-memory test backends.
+
+import { ZevmBindingError } from "../errors.vibe"
+import type { Address, Bytes32, Hex, QuantityHex } from "../types.vibe"
+
+export interface NativeNodeConfig {
+  readonly chainId?: number
+  readonly hardfork?: string
+}
+
+/** Low-level isolated ZEVM execution node handle. Managed by Effect Scope. */
+export interface ZevmNodeHandle {
+  /** Dispatch a raw JSON-RPC 2.0 string. Notifications return null. */
+  readonly rpc: (rawJson: string) => (string | null)!ZevmBindingError
+  /** Release underlying native / backend resources. Idempotent. */
+  readonly close: () => void!never
+}
+
+export type LightNetwork = "mainnet" | "sepolia" | "holesky" | "hoodi"
+
+export interface LightClientConfig {
+  readonly network: LightNetwork
+  readonly beaconRpcUrl: string
+  readonly executionRpcUrl: string
+}
+
+export type LightClientStatusCode = "not_synced" | "syncing" | "synced"
+
+/** Low-level ZEVM proof-backed light client handle. Managed by Effect Scope. */
+export interface ZevmLightClientHandle {
+  readonly syncStep: () => number!ZevmBindingError
+  readonly status: () => LightClientStatusCode!ZevmBindingError
+  readonly lastError: () => (string | null)!ZevmBindingError
+  readonly getBalance: (address: Address, blockNumber?: number) => QuantityHex!ZevmBindingError
+  readonly getTransactionCount: (address: Address, blockNumber?: number) => QuantityHex!ZevmBindingError
+  readonly getCode: (address: Address, blockNumber?: number) => Hex!ZevmBindingError
+  readonly getStorage: (address: Address, slot: Bytes32, blockNumber?: number) => Bytes32!ZevmBindingError
+  readonly close: () => void!never
+}
+
+export service ZevmBackend {
+  static readonly key = "@tevm/effect/ZevmBackend"
+  /** Human-readable name of the active backend (e.g. "zevm-node-napi", "zevm-memory", "zevm-remote"). */
+  readonly name: string
+  readonly version: () => string!ZevmBindingError
+  readonly abiVersion: () => number!ZevmBindingError
+  /** Acquire a scoped execution node handle; released automatically when Scope closes. */
+  readonly createNode: (config: NativeNodeConfig) => ZevmNodeHandle!ZevmBindingError!Scope.Scope
+  /** Acquire a scoped light client handle; released automatically when Scope closes. */
+  readonly createLightClient: (config: LightClientConfig) => ZevmLightClientHandle!ZevmBindingError!Scope.Scope
+}

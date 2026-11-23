@@ -1,0 +1,34 @@
+// Public entrypoint for @tevm/effect — Effect-native, aggressively dependency-injected
+// TEVM powered by ZEVM and ready for voltaire-effect v2.
+//
+// Zero Node.js / platform imports live here: import `@tevm/effect/platform/node` for
+// Node-API native ZEVM bindings, `@tevm/effect/testing` for the pure in-memory backend,
+// or `@tevm/effect/voltaire` to wire voltaire-effect v2 services.
+
+export * from "./types.vibe"
+export * from "./errors.vibe"
+export * from "./hex.vibe"
+
+// Core DI Services & Layers
+export * from "./services/common.vibe"
+export * from "./services/backend.vibe"
+export * from "./services/evm.vibe"
+export * from "./services/transport.vibe"
+export * from "./services/storage.vibe"
+export * from "./services/codec.vibe"
+
+// Actions
+export * from "./actions/eth.vibe"
+export * from "./actions/tevm.vibe"
+export * from "./actions/debug.vibe"
+export * from "./actions/contract.vibe"
+export * from "./actions/light.vibe"
+
+// Effect Streams
+export * from "./streams/index.vibe"
+
+// Platform-Agnostic HTTP JSON-RPC Server
+export * from "./server/http.vibe"
+
+// Composed Layers
+export * from "./layers.vibe"

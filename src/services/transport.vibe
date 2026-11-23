@@ -1,0 +1,374 @@
+// Transport service: aggressively dependency-injected JSON-RPC transport abstraction.
+// Every high-level Eth / Tevm / Debug / Stream / Contract action depends ONLY on Transport.
+// Implementations compose via Layers:
+//   - TransportFromEvm: direct in-process bridge to the injected Evm service
+//   - HttpTransport: platform-agnostic HTTP JSON-RPC over Effect's HttpClient
+//   - testTransport: deterministic in-memory mock transport for unit tests
+//   - withRetry / withTimeout / withLogging / fallbackTransport: composable Layer decorators!
+
+import { HttpClient, HttpClientRequest } from "effect/http"
+import { classifyRpcError, toTransportError, TransportError, ZevmBindingError } from "../errors.vibe"
+import { parseJson, stringifyJson } from "../hex.vibe"
+import type { JsonRpcEnvelope } from "../types.vibe"
+import { type LightClientConfig, type NativeNodeConfig, ZevmBackend } from "./backend.vibe"
+import { Evm } from "./evm.vibe"
+
+export service Transport {
+  static readonly key = "@tevm/effect/Transport"
+  /** Execute a JSON-RPC method and decode the result payload. */
+  readonly request: <T = unknown>(method: string, params?: readonly unknown[]) => T!TransportError
+  /** Dispatch a raw JSON-RPC 2.0 string (single, batch, or notification). */
+  readonly rpc: (rawJson: string) => (string | null)!TransportError
+}
+
+/**
+ * Bridge the injected in-process `Evm` service into `Transport`.
+ * Zero network hop, zero serialization overhead beyond ZEVM's native JSON-RPC ABI.
+ */
+export const TransportFromEvm = Layer.effect(
+  Transport,
+  effect {
+    const evm = try Evm
+    return {
+      effect request<T = unknown>(method: string, params: readonly unknown[] = []) {
+        return try Effect.mapError(
+          evm.request<T>(method, params),
+          (err) => toTransportError("evm", method, err),
+        )
+      },
+      effect rpc(rawJson: string) {
+        return try Effect.mapError(
+          evm.rpc(rawJson),
+          (err) => toTransportError("evm", undefined, err),
+        )
+      },
+    }
+  },
+)
+
+export interface HttpTransportOptions {
+  readonly headers?: Readonly<Record<string, string>>
+  readonly timeout?: Duration.Input
+}
+
+/**
+ * Platform-agnostic HTTP JSON-RPC Transport powered by Effect's `HttpClient`.
+ * Works on Node, Bun, Browser, Cloudflare Workers, Deno, and `TestHttpClient`!
+ */
+export function HttpTransport(url: string, options: HttpTransportOptions = {}) {
+  return Layer.effect(
+    Transport,
+    effect {
+      const client = try HttpClient.HttpClient
+      const nextIdRef = try Ref.make(0)
+
+      effect function dispatchRaw(rawJson: string, method?: string): (string | null)!TransportError {
+        let req = HttpClientRequest.post(url)
+        req = HttpClientRequest.setHeader(req, "content-type", "application/json")
+        if (options.headers !== undefined) {
+          for (const [k, v] of Object.entries(options.headers)) {
+            req = HttpClientRequest.setHeader(req, k, v)
+          }
+        }
+        req = HttpClientRequest.bodyText(req, rawJson, "application/json")
+
+        const send = effect {
+          const response = try Effect.mapError(
+            client.execute(req),
+            (cause) =>
+              new TransportError({
+                transport: "http",
+                method,
+                message: `HTTP request to ${url} failed`,
+                cause,
+              }),
+          )
+          if (response.status === 204) {
+            return null
+          }
+          if (response.status < 200 || response.status >= 300) {
+            const text = response.text catch () => ""
+            throw new TransportError({
+              transport: "http",
+              method,
+              statusCode: response.status,
+              message: `HTTP ${response.status} from ${url}${text.length > 0 ? `: ${text}` : ""}`,
+            })
+          }
+          return try Effect.mapError(
+            response.text,
+            (cause) =>
+              new TransportError({
+                transport: "http",
+                method,
+                statusCode: response.status,
+                message: "Failed to read HTTP response body",
+                cause,
+              }),
+          )
+        }
+
+        if (options.timeout !== undefined) {
+          return try Effect.timeoutOrElse(send, {
+            duration: options.timeout,
+            orElse: () =>
+              Effect.fail(
+                new TransportError({
+                  transport: "http",
+                  method,
+                  message: `HTTP request to ${url} timed out`,
+                }),
+              ),
+          })
+        }
+        return try send
+      }
+
+      return {
+        effect request<T = unknown>(method: string, params: readonly unknown[] = []) {
+          const id = try Ref.updateAndGet(nextIdRef, (n) => n + 1)
+          const body = (stringifyJson({ jsonrpc: "2.0", id, method, params })) catch effect (e) => {
+            throw new TransportError({
+              transport: "http",
+              method,
+              message: e.message,
+              cause: e,
+            })
+          }
+          const raw = try dispatchRaw(body, method)
+          if (raw === null) {
+            throw new TransportError({
+              transport: "http",
+              method,
+              message: `Received empty 204 response for "${method}"`,
+            })
+          }
+          const decoded = (parseJson(raw)) catch effect (e) => {
+            throw new TransportError({
+              transport: "http",
+              method,
+              code: -32700,
+              message: e.message,
+              cause: e,
+            })
+          }
+          const envelope = decoded as JsonRpcEnvelope<T>
+          if (envelope !== null && typeof envelope === "object" && "error" in envelope) {
+            throw toTransportError("http", method, classifyRpcError(method, envelope.error))
+          }
+          return envelope.result
+        },
+        effect rpc(rawJson: string) {
+          return try dispatchRaw(rawJson)
+        },
+      }
+    },
+  )
+}
+
+/**
+ * Wrap any injected `Transport` with an Effect `Schedule` retry policy.
+ * Composes cleanly as a Layer decorator over any transport!
+ */
+export function withTransportRetry(schedule: Schedule.Schedule<unknown, TransportError, never>) {
+  return Layer.effect(
+    Transport,
+    effect {
+      const inner = try Transport
+      return {
+        effect request<T = unknown>(method: string, params?: readonly unknown[]) {
+          return try Effect.retry(inner.request<T>(method, params), schedule)
+        },
+        effect rpc(rawJson: string) {
+          return try Effect.retry(inner.rpc(rawJson), schedule)
+        },
+      }
+    },
+  )
+}
+
+/** Wrap any injected `Transport` with a per-request Effect timeout. */
+export function withTransportTimeout(duration: Duration.Input) {
+  return Layer.effect(
+    Transport,
+    effect {
+      const inner = try Transport
+      return {
+        effect request<T = unknown>(method: string, params?: readonly unknown[]) {
+          return try Effect.timeoutOrElse(inner.request<T>(method, params), {
+            duration,
+            orElse: () =>
+              Effect.fail(
+                new TransportError({
+                  transport: "timeout",
+                  method,
+                  message: `RPC request "${method}" timed out`,
+                }),
+              ),
+          })
+        },
+        effect rpc(rawJson: string) {
+          return try Effect.timeoutOrElse(inner.rpc(rawJson), {
+            duration,
+            orElse: () =>
+              Effect.fail(
+                new TransportError({
+                  transport: "timeout",
+                  message: "Raw RPC request timed out",
+                }),
+              ),
+          })
+        },
+      }
+    },
+  )
+}
+
+/** Wrap any injected `Transport` with Effect structured logging and span instrumentation. */
+export const withTransportLogging = Layer.effect(
+  Transport,
+  effect {
+    const inner = try Transport
+    return {
+      effect request<T = unknown>(method: string, params?: readonly unknown[]) {
+        return try withSpan(
+          effect {
+            try Effect.logDebug(`tevm.rpc.request ${method}`)
+            return try inner.request<T>(method, params)
+          },
+          `tevm.rpc.${method}`,
+        )
+      },
+      effect rpc(rawJson: string) {
+        return try withSpan(
+          effect {
+            try Effect.logDebug("tevm.rpc.raw")
+            return try inner.rpc(rawJson)
+          },
+          "tevm.rpc.raw",
+        )
+      },
+    }
+  },
+)
+
+/**
+ * Create a fallback Transport Layer that tries transports in order until one succeeds.
+ * Takes pre-built `Transport.Shape` instances (e.g. resolved in a parent layer or custom list).
+ */
+export function fallbackTransport(transports: readonly Transport.Shape[]) {
+  return Layer.succeed(Transport, {
+    effect request<T = unknown>(method: string, params?: readonly unknown[]) {
+      let lastError: TransportError = new TransportError({
+        transport: "fallback",
+        method,
+        message: "No fallback transports configured",
+      })
+      for (const candidate of transports) {
+        const outcome = try exit(candidate.request<T>(method, params))
+        if (Exit.isSuccess(outcome)) {
+          return outcome.value
+        }
+        const failure = Cause.findErrorOption(outcome.cause)
+        if (Option.isSome(failure)) {
+          lastError = failure.value
+        }
+      }
+      throw lastError
+    },
+    effect rpc(rawJson: string) {
+      let lastError: TransportError = new TransportError({
+        transport: "fallback",
+        message: "No fallback transports configured",
+      })
+      for (const candidate of transports) {
+        const outcome = try exit(candidate.rpc(rawJson))
+        if (Exit.isSuccess(outcome)) {
+          return outcome.value
+        }
+        const failure = Cause.findErrorOption(outcome.cause)
+        if (Option.isSome(failure)) {
+          lastError = failure.value
+        }
+      }
+      throw lastError
+    },
+  })
+}
+
+export type TestTransportHandler = (
+  method: string,
+  params: readonly unknown[],
+) => unknown!TransportError
+
+/** Build a deterministic in-memory test Transport Layer from an Effect handler. */
+export function testTransport(handler: TestTransportHandler) {
+  return Layer.succeed(Transport, {
+    effect request<T = unknown>(method: string, params: readonly unknown[] = []) {
+      return (try handler(method, params)) as T
+    },
+    effect rpc(rawJson: string) {
+      const parsed = (parseJson(rawJson)) catch effect (e) => {
+        throw new TransportError({
+          transport: "test",
+          code: -32700,
+          message: e.message,
+          cause: e,
+        })
+      }
+      const req = parsed as { id?: number | string | null; method: string; params?: readonly unknown[] }
+      const result = try handler(req.method, req.params ?? [])
+      if (req.id === undefined) return null
+      return (stringifyJson({ jsonrpc: "2.0", id: req.id, result })) catch effect (e) => {
+        throw new TransportError({
+          transport: "test",
+          method: req.method,
+          message: e.message,
+          cause: e,
+        })
+      }
+    },
+  })
+}
+
+/**
+ * Expose ANY `Transport` (for example `HttpTransport("http://localhost:8545")`) as a
+ * `ZevmBackend`, allowing browsers and Cloudflare Workers to run the full `Evm` service
+ * against a remote ZEVM node without native addons.
+ */
+export const ZevmBackendFromTransport = Layer.effect(
+  ZevmBackend,
+  effect {
+    const transport = try Transport
+    return {
+      name: "zevm-remote-transport",
+      effect version() {
+        return try Effect.mapError(
+          transport.request<string>("web3_clientVersion"),
+          (cause) => new ZevmBindingError({ reason: cause.message, cause }),
+        )
+      },
+      effect abiVersion() {
+        return 1
+      },
+      effect createNode(_config: NativeNodeConfig) {
+        return {
+          effect rpc(rawJson: string) {
+            return try Effect.mapError(
+              transport.rpc(rawJson),
+              (cause) => new ZevmBindingError({ reason: cause.message, cause }),
+            )
+          },
+          effect close() {
+            // Remote transport lifecycle is managed by its outer Layer.
+          },
+        }
+      },
+      effect createLightClient(_config: LightClientConfig) {
+        throw new ZevmBindingError({
+          reason: "LightClient requires a native or WASM ZevmBackend",
+        })
+      },
+    }
+  },
+)

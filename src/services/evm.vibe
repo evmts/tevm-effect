@@ -1,0 +1,224 @@
+// Evm service: serialized, Effect-scoped, observable execution node over ZevmBackend + Common.
+// Replaces Node EventEmitter + manual promise queues + setInterval with:
+//   - Effect Semaphore (1-permit serialization for synchronous native handles)
+//   - Effect Scope / acquireRelease (guaranteed native handle release, impossible to leak)
+//   - Effect PubSub + Stream (composable, backpressure-aware live event streams)
+//   - Effect Clock + Schedule (deterministic TestClock-friendly block polling)
+
+import { classifyRpcError, JsonRpcParseError, NodeClosedError, type RpcError, ZevmBindingError } from "../errors.vibe"
+import { parseJson, parseQuantityHex, stringifyJson, toQuantityHex } from "../hex.vibe"
+import type { BlockObject, JsonRpcEnvelope, NodeInfo, NodeMetadata, RpcCall } from "../types.vibe"
+import { ZevmBackend } from "./backend.vibe"
+import { Common } from "./common.vibe"
+
+export data EngineEvent {
+  Request { method: string; params: readonly unknown[] }
+  Response { method: string; result: unknown }
+  RpcFailure { method: string; error: RpcError }
+  Block { block: BlockObject<false> }
+  Closed
+}
+
+export interface EvmBatchOutcome {
+  readonly id: number
+  readonly result?: unknown
+  readonly error?: RpcError
+}
+
+export type EvmError = RpcError | NodeClosedError | ZevmBindingError
+
+export service Evm {
+  static readonly key = "@tevm/effect/Evm"
+  /** Execute a single typed JSON-RPC call against the serialized ZEVM engine. */
+  readonly request: <T = unknown>(method: string, params?: readonly unknown[]) => T!EvmError
+  /** Dispatch a raw JSON-RPC 2.0 string (single, batch, or notification). */
+  readonly rpc: (rawJson: string) => (string | null)!(NodeClosedError | ZevmBindingError)
+  /** Execute a JSON-RPC 2.0 batch atomically in one serialized engine turn. */
+  readonly batch: (
+    calls: readonly RpcCall[],
+  ) => (readonly EvmBatchOutcome[])!(NodeClosedError | ZevmBindingError | JsonRpcParseError)
+  /** Subscribe to the live EngineEvent stream (requests, responses, errors, mined blocks, close). */
+  readonly events: Stream.Stream<EngineEvent>
+  /**
+   * Lazy Effect Stream of newly produced blocks (including native interval mining).
+   * Polls via Effect Clock & Schedule so it works deterministically with TestClock.
+   */
+  readonly watchBlocks: (pollInterval?: Duration.Input) => Stream.Stream<BlockObject<false>, EvmError>
+  /** Read ZEVM node metadata (`zevm_metadata`). */
+  readonly metadata: () => NodeMetadata!EvmError
+  /** Read ZEVM node info (`zevm_nodeInfo`). */
+  readonly nodeInfo: () => NodeInfo!EvmError
+}
+
+/**
+ * Live Evm Layer.
+ * Requires `Common` and `ZevmBackend`.
+ * Acquires the underlying ZEVM handle inside the Layer's Scope, applies fork & mining
+ * settings from `Common`, and guarantees release + Closed event broadcast on scope finalization.
+ */
+export const EvmLive = Layer.effect(
+  Evm,
+  effect {
+    const common = try Common
+    const backend = try ZevmBackend
+
+    const handle = try backend.createNode({
+      chainId: common.chainId,
+      hardfork: common.hardfork,
+    })
+
+    const lock = try Semaphore.make(1)
+    const nextIdRef = try Ref.make(0)
+    const closedRef = try Ref.make(false)
+    const eventBus = try PubSub.unbounded<EngineEvent>()
+
+    // Register scope finalizer to mark closed, broadcast Closed, and release native memory.
+    try Effect.addFinalizer(() =>
+      effect {
+        const alreadyClosed = try Ref.getAndSet(closedRef, true)
+        if (!alreadyClosed) {
+          try PubSub.publish(eventBus, EngineEvent.Closed())
+          try PubSub.shutdown(eventBus)
+          try handle.close()
+        }
+      }
+    )
+
+    effect function rawDispatch(rawJson: string): (string | null)!(NodeClosedError | ZevmBindingError) {
+      return try lock.withPermits(1)(
+        effect {
+          const isClosed = try Ref.get(closedRef)
+          if (isClosed) throw new NodeClosedError({ operation: "rpc" })
+          return try handle.rpc(rawJson)
+        },
+      )
+    }
+
+    effect function executeOne<T>(method: string, params: readonly unknown[] = []): T!EvmError {
+      const id = try Ref.updateAndGet(nextIdRef, (n) => n + 1)
+      const payload = (
+        stringifyJson({
+          jsonrpc: "2.0",
+          id,
+          method,
+          params,
+        })
+      ) catch effect (e) => {
+        throw new ZevmBindingError({ reason: e.message, cause: e })
+      }
+
+      try PubSub.publish(eventBus, EngineEvent.Request({ method, params }))
+
+      const rawResponse = try rawDispatch(payload)
+      if (rawResponse === null) {
+        throw new JsonRpcParseError({
+          message: `Unexpected null response for non-notification method "${method}"`,
+        })
+      }
+
+      const decoded = (try parseJson(rawResponse)) as JsonRpcEnvelope<T>
+      if (decoded !== null && typeof decoded === "object" && "error" in decoded) {
+        const rpcErr = classifyRpcError(method, decoded.error)
+        try PubSub.publish(eventBus, EngineEvent.RpcFailure({ method, error: rpcErr }))
+        throw rpcErr
+      }
+
+      const result = decoded.result
+      try PubSub.publish(eventBus, EngineEvent.Response({ method, result }))
+      return result
+    }
+
+    // Apply Common fork & mining configuration before exposing the Evm service.
+    if (common.fork !== undefined) {
+      const forkPayload: Record<string, unknown> = {
+        url: common.fork.url,
+      }
+      if (common.fork.blockNumber !== undefined) {
+        forkPayload["blockNumber"] = toQuantityHex(common.fork.blockNumber)
+      }
+      try executeOne("zevm_reset", [forkPayload])
+    }
+
+    if (common.mining.mode === "auto") {
+      try executeOne("zevm_setAutomine", [true])
+    } else if (common.mining.mode === "manual") {
+      try executeOne("zevm_setAutomine", [false])
+    } else if (common.mining.mode === "interval" && common.mining.intervalSeconds !== undefined) {
+      try executeOne("zevm_setAutomine", [false])
+      try executeOne("zevm_setIntervalMining", [toQuantityHex(common.mining.intervalSeconds)])
+    }
+
+    function watchBlocks(pollInterval: Duration.Input = "50 millis"): Stream.Stream<BlockObject<false>, EvmError> {
+      effect function* streamBlocks() {
+        const initialHex = try executeOne<string>("eth_blockNumber")
+        let lastSeen = (parseQuantityHex(initialHex)) catch () => 0n
+        while (true) {
+          try sleep(pollInterval)
+          const headHex = try executeOne<string>("eth_blockNumber")
+          const head = (parseQuantityHex(headHex)) catch () => lastSeen
+          for (let n = lastSeen + 1n; n <= head; n = n + 1n) {
+            const block = try executeOne<BlockObject<false> | null>("eth_getBlockByNumber", [
+              toQuantityHex(n),
+              false,
+            ])
+            if (block !== null) {
+              try PubSub.publish(eventBus, EngineEvent.Block({ block }))
+              yield block
+            }
+          }
+          if (head > lastSeen) lastSeen = head
+        }
+      }
+      return streamBlocks()
+    }
+
+    return {
+      request: executeOne,
+      rpc: rawDispatch,
+      effect batch(calls: readonly RpcCall[]) {
+        if (calls.length === 0) return []
+        const startId = try Ref.getAndUpdate(nextIdRef, (n) => n + calls.length)
+        const envelope = calls.map((call, idx) => ({
+          jsonrpc: "2.0" as const,
+          id: startId + idx + 1,
+          method: call.method,
+          params: call.params ?? [],
+        }))
+        const serialized = (stringifyJson(envelope)) catch effect (e) => {
+          throw new ZevmBindingError({ reason: e.message, cause: e })
+        }
+        const raw = try rawDispatch(serialized)
+        if (raw === null) return []
+        const parsed = try parseJson(raw)
+        if (!Array.isArray(parsed)) {
+          throw new JsonRpcParseError({ message: "Expected JSON-RPC batch response array", raw })
+        }
+        const outcomes: EvmBatchOutcome[] = []
+        for (let i = 0; i < parsed.length; i++) {
+          const item = parsed[i] as JsonRpcEnvelope<unknown>
+          const method = calls[i]?.method ?? "batch"
+          if ("error" in item) {
+            outcomes.push({
+              id: typeof item.id === "number" ? item.id : startId + i + 1,
+              error: classifyRpcError(method, item.error),
+            })
+          } else {
+            outcomes.push({
+              id: typeof item.id === "number" ? item.id : startId + i + 1,
+              result: item.result,
+            })
+          }
+        }
+        return outcomes
+      },
+      events: Stream.fromPubSub(eventBus),
+      watchBlocks,
+      effect metadata() {
+        return try executeOne<NodeMetadata>("zevm_metadata")
+      },
+      effect nodeInfo() {
+        return try executeOne<NodeInfo>("zevm_nodeInfo")
+      },
+    }
+  },
+)

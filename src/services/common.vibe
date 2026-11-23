@@ -1,0 +1,216 @@
+// Common service: dependency-injected chain, hardfork, mining, and fork configuration.
+// Every TEVM node, transport, and action can read chain config from Common
+// without ever hardcoding chain IDs, hardforks, or gas limits.
+
+import { InvalidConfigError } from "../errors.vibe"
+import type { ChainSpec, ForkConfig, Hardfork, MiningConfig } from "../types.vibe"
+
+export service Common: ChainSpec {
+  static readonly key = "@tevm/effect/Common"
+}
+
+export const defaultEthCurrency = {
+  name: "Ether",
+  symbol: "ETH",
+  decimals: 18,
+} as const
+
+export const defaultMiningConfig: MiningConfig = {
+  mode: "auto",
+}
+
+/** Validate a ChainSpec inside Effect, failing with InvalidConfigError on bad fields. */
+export effect function validateChainSpec(spec: ChainSpec): ChainSpec!InvalidConfigError {
+  if (!Number.isSafeInteger(spec.chainId) || spec.chainId < 0) {
+    throw new InvalidConfigError({
+      field: "chainId",
+      value: spec.chainId,
+      reason: "chainId must be a non-negative safe integer",
+    })
+  }
+  if (!Number.isSafeInteger(spec.blockTimeMs) || spec.blockTimeMs < 0) {
+    throw new InvalidConfigError({
+      field: "blockTimeMs",
+      value: spec.blockTimeMs,
+      reason: "blockTimeMs must be a non-negative safe integer",
+    })
+  }
+  if (spec.blockGasLimit <= 0n) {
+    throw new InvalidConfigError({
+      field: "blockGasLimit",
+      value: spec.blockGasLimit,
+      reason: "blockGasLimit must be positive",
+    })
+  }
+  if (spec.mining.mode === "interval") {
+    const interval = spec.mining.intervalSeconds
+    if (interval === undefined || !Number.isSafeInteger(interval) || interval <= 0) {
+      throw new InvalidConfigError({
+        field: "mining.intervalSeconds",
+        value: interval,
+        reason: "interval mining requires a positive safe integer intervalSeconds",
+      })
+    }
+  }
+  if (spec.fork !== undefined) {
+    if (spec.fork.url.length === 0 || (!spec.fork.url.startsWith("http://") && !spec.fork.url.startsWith("https://"))) {
+      throw new InvalidConfigError({
+        field: "fork.url",
+        value: spec.fork.url,
+        reason: "fork.url must be a non-empty http:// or https:// URL",
+      })
+    }
+    if (spec.fork.blockNumber !== undefined) {
+      const bn = spec.fork.blockNumber
+      if (typeof bn === "number" && (!Number.isSafeInteger(bn) || bn < 0)) {
+        throw new InvalidConfigError({
+          field: "fork.blockNumber",
+          value: bn,
+          reason: "fork.blockNumber must be a non-negative safe integer or bigint",
+        })
+      }
+      if (typeof bn === "bigint" && bn < 0n) {
+        throw new InvalidConfigError({
+          field: "fork.blockNumber",
+          value: bn,
+          reason: "fork.blockNumber must be non-negative",
+        })
+      }
+    }
+  }
+  return spec
+}
+
+/** Create a validated Common Layer from a full or partial ChainSpec. */
+export function makeCommonLayer(overrides: Partial<ChainSpec> = {}) {
+  const spec: ChainSpec = {
+    chainId: overrides.chainId ?? 900,
+    name: overrides.name ?? "Tevm Local",
+    hardfork: overrides.hardfork ?? "osaka",
+    nativeCurrency: overrides.nativeCurrency ?? defaultEthCurrency,
+    blockTimeMs: overrides.blockTimeMs ?? 12_000,
+    blockGasLimit: overrides.blockGasLimit ?? 30_000_000n,
+    testnet: overrides.testnet ?? true,
+    fork: overrides.fork,
+    mining: overrides.mining ?? defaultMiningConfig,
+  }
+  return Layer.effect(Common, validateChainSpec(spec))
+}
+
+// Built-in chain presets as composable Layers
+
+export const TevmLocalCommon = makeCommonLayer({
+  chainId: 900,
+  name: "Tevm Local",
+  hardfork: "osaka",
+  testnet: true,
+})
+
+export const AnvilCommon = makeCommonLayer({
+  chainId: 31337,
+  name: "Anvil / ZEVM Local",
+  hardfork: "osaka",
+  testnet: true,
+})
+
+export const MainnetCommon = makeCommonLayer({
+  chainId: 1,
+  name: "Ethereum",
+  hardfork: "osaka",
+  blockTimeMs: 12_000,
+  testnet: false,
+})
+
+export const SepoliaCommon = makeCommonLayer({
+  chainId: 11155111,
+  name: "Sepolia",
+  hardfork: "osaka",
+  blockTimeMs: 12_000,
+  testnet: true,
+})
+
+export const HoleskyCommon = makeCommonLayer({
+  chainId: 17000,
+  name: "Holesky",
+  hardfork: "osaka",
+  blockTimeMs: 12_000,
+  testnet: true,
+})
+
+export const HoodiCommon = makeCommonLayer({
+  chainId: 560048,
+  name: "Hoodi",
+  hardfork: "osaka",
+  blockTimeMs: 12_000,
+  testnet: true,
+})
+
+export const OptimismCommon = makeCommonLayer({
+  chainId: 10,
+  name: "OP Mainnet",
+  hardfork: "osaka",
+  blockTimeMs: 2_000,
+  testnet: false,
+})
+
+export const BaseCommon = makeCommonLayer({
+  chainId: 8453,
+  name: "Base",
+  hardfork: "osaka",
+  blockTimeMs: 2_000,
+  testnet: false,
+})
+
+export const ArbitrumCommon = makeCommonLayer({
+  chainId: 42161,
+  name: "Arbitrum One",
+  hardfork: "osaka",
+  blockTimeMs: 250,
+  testnet: false,
+})
+
+// Layer combinators for composing Common tweaks declaratively
+
+/** Derive a new Common Layer with fork configuration attached to an existing Common. */
+export function withFork(forkConfig: ForkConfig) {
+  return Layer.effect(
+    Common,
+    effect {
+      const current = try Common
+      return try validateChainSpec({ ...current, fork: forkConfig })
+    },
+  )
+}
+
+/** Derive a new Common Layer with updated mining configuration. */
+export function withMining(mining: MiningConfig) {
+  return Layer.effect(
+    Common,
+    effect {
+      const current = try Common
+      return try validateChainSpec({ ...current, mining })
+    },
+  )
+}
+
+/** Derive a new Common Layer with updated hardfork. */
+export function withHardfork(hardfork: Hardfork) {
+  return Layer.effect(
+    Common,
+    effect {
+      const current = try Common
+      return try validateChainSpec({ ...current, hardfork })
+    },
+  )
+}
+
+/** Derive a new Common Layer with updated chainId. */
+export function withChainId(chainId: number) {
+  return Layer.effect(
+    Common,
+    effect {
+      const current = try Common
+      return try validateChainSpec({ ...current, chainId })
+    },
+  )
+}

@@ -1,0 +1,139 @@
+// Contract actions powered by aggressively injected `Transport` + `AbiCodec`.
+// Swap `AbiCodecZevm` for `VoltaireAbiCodec` (voltaire-effect v2) with zero changes
+// to any contract call site!
+
+import { CodecError, TransportError } from "../errors.vibe"
+import { AbiCodec } from "../services/codec.vibe"
+import { Transport } from "../services/transport.vibe"
+import type {
+  Abi,
+  Address,
+  BlockSelector,
+  CallParams,
+  CallResult,
+  DecodedEventLog,
+  Hex,
+  LogFilter,
+  StateOverrideSet,
+} from "../types.vibe"
+import { getLogs } from "./eth.vibe"
+import { tevmCall } from "./tevm.vibe"
+
+export interface ReadContractParams {
+  readonly address: Address
+  readonly abi: Abi
+  readonly functionName: string
+  readonly args?: readonly unknown[]
+  readonly from?: Address
+  readonly value?: bigint
+  readonly gas?: bigint
+  readonly blockTag?: BlockSelector
+  readonly stateOverride?: StateOverrideSet
+}
+
+export interface WriteContractParams extends ReadContractParams {
+  readonly addToMempool?: boolean
+  readonly addToBlockchain?: boolean
+  readonly gasPrice?: bigint
+  readonly nonce?: bigint
+}
+
+export interface DeployContractParams {
+  readonly abi: Abi
+  readonly bytecode: Hex
+  readonly args?: readonly unknown[]
+  readonly from?: Address
+  readonly value?: bigint
+  readonly gas?: bigint
+  readonly gasPrice?: bigint
+  readonly nonce?: bigint
+  readonly addToMempool?: boolean
+  readonly addToBlockchain?: boolean
+}
+
+export interface ContractCallOutcome<T = unknown> extends CallResult {
+  readonly decoded?: T
+}
+
+/** Read a contract function via `eth_call` using injected `AbiCodec` + `Transport`. */
+export effect function readContract<T = unknown>(
+  params: ReadContractParams,
+): T!(TransportError | CodecError)!(Transport | AbiCodec) {
+  const codec = try AbiCodec
+  const data = try codec.encodeFunctionData(params.abi, params.functionName, params.args)
+  const res = try tevmCall({
+    to: params.address,
+    from: params.from,
+    value: params.value,
+    gas: params.gas,
+    data,
+    blockTag: params.blockTag,
+    stateOverride: params.stateOverride,
+  })
+  return (try codec.decodeFunctionResult(params.abi, params.functionName, res.rawData)) as T
+}
+
+/** Simulate a state-changing contract call (or submit + mine when addToBlockchain/addToMempool is set). */
+export effect function writeContract<T = unknown>(
+  params: WriteContractParams,
+): ContractCallOutcome<T>!(TransportError | CodecError)!(Transport | AbiCodec) {
+  const codec = try AbiCodec
+  const data = try codec.encodeFunctionData(params.abi, params.functionName, params.args)
+  const addToBlockchain = params.addToBlockchain ?? (params.addToMempool ? false : true)
+  const res = try tevmCall({
+    to: params.address,
+    from: params.from,
+    value: params.value,
+    gas: params.gas,
+    gasPrice: params.gasPrice,
+    nonce: params.nonce,
+    data,
+    blockTag: params.blockTag,
+    stateOverride: params.stateOverride,
+    addToMempool: params.addToMempool,
+    addToBlockchain,
+  })
+  if (res.rawData !== "0x" && res.rawData.length > 2) {
+    const decoded = (try codec.decodeFunctionResult(params.abi, params.functionName, res.rawData)) as T
+    return { ...res, decoded }
+  }
+  return res
+}
+
+/** Deploy a contract with ABI-encoded constructor arguments and return the receipt + deployed address. */
+export effect function deployContract(
+  params: DeployContractParams,
+): (CallResult & { readonly contractAddress: Address | null })!(TransportError | CodecError)!(Transport | AbiCodec) {
+  const codec = try AbiCodec
+  const initCode = try codec.encodeDeployData(params.abi, params.bytecode, params.args)
+  const callParams: CallParams = {
+    from: params.from,
+    value: params.value,
+    gas: params.gas,
+    gasPrice: params.gasPrice,
+    nonce: params.nonce,
+    data: initCode,
+    addToMempool: params.addToMempool,
+    addToBlockchain: params.addToBlockchain ?? (params.addToMempool ? false : true),
+  }
+  const res = try tevmCall(callParams)
+  const contractAddress = res.receipt?.contractAddress ?? null
+  return { ...res, contractAddress }
+}
+
+/** Fetch and decode contract event logs matching a filter. */
+export effect function getContractEvents(
+  abi: Abi,
+  filter: LogFilter,
+): (readonly DecodedEventLog[])!(TransportError | CodecError)!(Transport | AbiCodec) {
+  const codec = try AbiCodec
+  const logs = try getLogs(filter)
+  const decoded: DecodedEventLog[] = []
+  for (const log of logs) {
+    const maybeDecoded = (codec.decodeEventLog(abi, log)) catch () => null
+    if (maybeDecoded !== null) {
+      decoded.push(maybeDecoded)
+    }
+  }
+  return decoded
+}

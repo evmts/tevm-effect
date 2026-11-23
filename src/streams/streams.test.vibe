@@ -1,0 +1,95 @@
+import { assert, describe, it } from "@effect/vitest"
+import { TestClock } from "effect/testing"
+import {
+  accountBalanceStream,
+  AnvilCommon,
+  blockStream,
+  logStream,
+  receiptStream,
+  sendTransaction,
+  stateAccountStream,
+  tevmMine,
+  tevmSetAutomine,
+  tevmSetBalance,
+  TevmCoreLive,
+  transactionStream,
+} from "../index.vibe"
+import { DEFAULT_DEV_ACCOUNTS, ZevmBackendMemory } from "../testing/index.vibe"
+
+const MemoryTevm = Layer.provideMerge(
+  TevmCoreLive,
+  Layer.merge(AnvilCommon, ZevmBackendMemory),
+)
+
+describe("Effect Streams as Blockchain Data Structures", () => {
+  it.effect("backfills historical blocks and tails live mined blocks with TestClock", effect () => {
+    provide MemoryTevm {
+      try tevmMine({ blocks: 3 })
+
+      // Bounded historical backfill
+      const historical = try Stream.runCollect(blockStream({ fromBlock: 0n, toBlock: 3n }))
+      try Effect.try(() => assert.deepStrictEqual(historical.map((b) => b.number), ["0x0", "0x1", "0x2", "0x3"]))
+
+      // Live block stream with TestClock
+      const liveFiber = fork Stream.runCollect(Stream.take(blockStream({ pollInterval: "50 millis" }), 2))
+      try Effect.yieldNow
+      try tevmMine({ blocks: 2 })
+      try TestClock.adjust("100 millis")
+      const liveBlocks = try join liveFiber
+      try Effect.try(() => assert.deepStrictEqual(liveBlocks.map((b) => b.number), ["0x4", "0x5"]))
+    }
+  })
+
+  it.effect("streams transactions, logs, and receipts concurrently", effect () => {
+    provide MemoryTevm {
+      const target = "0x0000000000000000000000000000000000001234" as const
+      const h1 = try sendTransaction({ from: DEFAULT_DEV_ACCOUNTS[0], to: target, value: 1n, data: "0xabcd" })
+      const h2 = try sendTransaction({ from: DEFAULT_DEV_ACCOUNTS[0], to: target, value: 2n, data: "0xef01" })
+
+      const txs = try Stream.runCollect(transactionStream({ fromBlock: 1n, toBlock: 2n }))
+      try Effect.try(() => assert.strictEqual(txs.length, 2))
+      try Effect.try(() => assert.deepStrictEqual(txs.map((t) => t.hash), [h1, h2]))
+
+      const logs = try Stream.runCollect(
+        logStream({ address: target }, { fromBlock: 0n, toBlock: 2n, chunkSize: 1n }),
+      )
+      try Effect.try(() => assert.strictEqual(logs.length, 2))
+
+      const receipts = try Stream.runCollect(receiptStream([h1, h2], { concurrency: 2 }))
+      try Effect.try(() => assert.strictEqual(receipts.length, 2))
+      try Effect.try(() => assert.strictEqual(receipts[0]?.status, "0x1"))
+    }
+  })
+
+  it.effect("emits only distinct balance changes via accountBalanceStream", effect () => {
+    provide MemoryTevm {
+      try tevmSetAutomine(false)
+      const watched = "0x0000000000000000000000000000000000009999" as const
+      try tevmSetBalance(watched, 100n)
+
+      const watcher = fork Stream.runCollect(
+        Stream.take(accountBalanceStream(watched, { pollInterval: "50 millis" }), 2),
+      )
+      try Effect.yieldNow
+      // Mine a block with NO balance change -> should be deduplicated!
+      try tevmMine({ blocks: 1 })
+      try TestClock.adjust("50 millis")
+      // Now change balance and mine -> should emit 2nd event!
+      try tevmSetBalance(watched, 500n)
+      try tevmMine({ blocks: 1 })
+      try TestClock.adjust("50 millis")
+
+      const changes = try join watcher
+      try Effect.try(() => assert.strictEqual(changes.length, 2))
+      try Effect.try(() => assert.strictEqual(changes[0]?.balance, 100n))
+      try Effect.try(() => assert.strictEqual(changes[1]?.balance, 500n))
+    }
+  })
+
+  it.effect("streams all accounts in state dump via stateAccountStream", effect () => {
+    provide MemoryTevm {
+      const entries = try Stream.runCollect(stateAccountStream())
+      try Effect.try(() => assert.strictEqual(entries.length >= DEFAULT_DEV_ACCOUNTS.length, true))
+    }
+  })
+})

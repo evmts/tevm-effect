@@ -1,0 +1,393 @@
+// Standard Ethereum JSON-RPC actions.
+// Every action is a composable Effect depending ONLY on `Transport` — completely
+// decoupled from how the transport is backed (in-process ZEVM, HTTP, fallback, mock).
+
+import { CodecError, ReceiptTimeoutError, TransportError } from "../errors.vibe"
+import {
+  formatBlockSelector,
+  formatStateOverrideSet,
+  formatTransactionRequest,
+  parseQuantityHex,
+  toQuantityHex,
+} from "../hex.vibe"
+import { Transport } from "../services/transport.vibe"
+import type {
+  AccessListResult,
+  Address,
+  BlockObject,
+  BlockSelector,
+  Bytes32,
+  FeeHistoryResult,
+  Hash32,
+  Hex,
+  LogFilter,
+  LogObject,
+  QuantityHex,
+  ReceiptObject,
+  StateOverrideSet,
+  TransactionObject,
+  TransactionRequest,
+  TxPoolContent,
+  TxPoolStatus,
+} from "../types.vibe"
+
+// Core reads
+
+export effect function getChainId(): bigint!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const hex = try transport.request<QuantityHex>("eth_chainId")
+  return try parseQuantityHex(hex)
+}
+
+export effect function getBlockNumber(): bigint!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const hex = try transport.request<QuantityHex>("eth_blockNumber")
+  return try parseQuantityHex(hex)
+}
+
+export effect function getBalance(
+  address: Address,
+  block?: BlockSelector,
+): bigint!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const hex = try transport.request<QuantityHex>("eth_getBalance", [
+    address,
+    formatBlockSelector(block),
+  ])
+  return try parseQuantityHex(hex)
+}
+
+export effect function getCode(
+  address: Address,
+  block?: BlockSelector,
+): Hex!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Hex>("eth_getCode", [address, formatBlockSelector(block)])
+}
+
+export effect function getStorageAt(
+  address: Address,
+  slot: Bytes32,
+  block?: BlockSelector,
+): Bytes32!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Bytes32>("eth_getStorageAt", [
+    address,
+    slot,
+    formatBlockSelector(block),
+  ])
+}
+
+export effect function getStorageValues(
+  storageRequest: Readonly<Record<Address, readonly Bytes32[]>>,
+  block?: BlockSelector,
+): Readonly<Record<Address, readonly Bytes32[]>>!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Readonly<Record<Address, readonly Bytes32[]>>>(
+    "eth_getStorageValues",
+    [storageRequest, formatBlockSelector(block)],
+  )
+}
+
+export effect function getTransactionCount(
+  address: Address,
+  block?: BlockSelector,
+): bigint!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const hex = try transport.request<QuantityHex>("eth_getTransactionCount", [
+    address,
+    formatBlockSelector(block),
+  ])
+  return try parseQuantityHex(hex)
+}
+
+export effect function getAccounts(): (readonly Address[])!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<readonly Address[]>("eth_accounts")
+}
+
+export effect function getCoinbase(): Address!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Address>("eth_coinbase")
+}
+
+export effect function getGasPrice(): bigint!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const hex = try transport.request<QuantityHex>("eth_gasPrice")
+  return try parseQuantityHex(hex)
+}
+
+export effect function getMaxPriorityFeePerGas(): bigint!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const hex = try transport.request<QuantityHex>("eth_maxPriorityFeePerGas")
+  return try parseQuantityHex(hex)
+}
+
+export effect function getBlobBaseFee(): bigint!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const hex = try transport.request<QuantityHex>("eth_blobBaseFee")
+  return try parseQuantityHex(hex)
+}
+
+export effect function getFeeHistory(
+  blockCount: number | bigint,
+  newestBlock: BlockSelector,
+  rewardPercentiles?: readonly number[],
+): FeeHistoryResult!TransportError!Transport {
+  const transport = try Transport
+  const params: unknown[] = [toQuantityHex(blockCount), formatBlockSelector(newestBlock)]
+  if (rewardPercentiles !== undefined) {
+    params.push(rewardPercentiles)
+  }
+  return try transport.request<FeeHistoryResult>("eth_feeHistory", params)
+}
+
+// Simulation
+
+export effect function ethCall(
+  tx: TransactionRequest,
+  block?: BlockSelector,
+  stateOverrides?: StateOverrideSet,
+): Hex!TransportError!Transport {
+  const transport = try Transport
+  const params: unknown[] = [formatTransactionRequest(tx), formatBlockSelector(block)]
+  if (stateOverrides !== undefined) {
+    params.push(formatStateOverrideSet(stateOverrides))
+  }
+  return try transport.request<Hex>("eth_call", params)
+}
+
+export effect function estimateGas(
+  tx: TransactionRequest,
+  block?: BlockSelector,
+  stateOverrides?: StateOverrideSet,
+): bigint!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const params: unknown[] = [formatTransactionRequest(tx)]
+  if (block !== undefined || stateOverrides !== undefined) {
+    params.push(formatBlockSelector(block))
+  }
+  if (stateOverrides !== undefined) {
+    params.push(formatStateOverrideSet(stateOverrides))
+  }
+  const hex = try transport.request<QuantityHex>("eth_estimateGas", params)
+  return try parseQuantityHex(hex)
+}
+
+export effect function createAccessList(
+  tx: TransactionRequest,
+  block?: BlockSelector,
+): AccessListResult!TransportError!Transport {
+  const transport = try Transport
+  const params: unknown[] = [formatTransactionRequest(tx)]
+  if (block !== undefined) {
+    params.push(formatBlockSelector(block))
+  }
+  return try transport.request<AccessListResult>("eth_createAccessList", params)
+}
+
+export effect function simulateV1(
+  payload: Readonly<Record<string, unknown>>,
+  block?: BlockSelector,
+): (readonly unknown[])!TransportError!Transport {
+  const transport = try Transport
+  const params: unknown[] = [payload]
+  if (block !== undefined) {
+    params.push(formatBlockSelector(block))
+  }
+  return try transport.request<readonly unknown[]>("eth_simulateV1", params)
+}
+
+// Submission & signing
+
+export effect function sendTransaction(tx: TransactionRequest): Hash32!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Hash32>("eth_sendTransaction", [formatTransactionRequest(tx)])
+}
+
+export effect function sendRawTransaction(rawTx: Hex): Hash32!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Hash32>("eth_sendRawTransaction", [rawTx])
+}
+
+export effect function signMessage(address: Address, data: Hex): Hex!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Hex>("eth_sign", [address, data])
+}
+
+export effect function signTransaction(tx: TransactionRequest): Hex!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Hex>("eth_signTransaction", [formatTransactionRequest(tx)])
+}
+
+// Queries
+
+export effect function getBlockByNumber<TFull extends boolean = false>(
+  block: BlockSelector = "latest",
+  fullTransactions?: TFull,
+): (BlockObject<TFull> | null)!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<BlockObject<TFull> | null>("eth_getBlockByNumber", [
+    formatBlockSelector(block),
+    fullTransactions ?? false,
+  ])
+}
+
+export effect function getBlockByHash<TFull extends boolean = false>(
+  blockHash: Hash32,
+  fullTransactions?: TFull,
+): (BlockObject<TFull> | null)!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<BlockObject<TFull> | null>("eth_getBlockByHash", [
+    blockHash,
+    fullTransactions ?? false,
+  ])
+}
+
+export effect function getBlockTransactionCountByHash(
+  blockHash: Hash32,
+): (bigint | null)!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const hex = try transport.request<QuantityHex | null>("eth_getBlockTransactionCountByHash", [
+    blockHash,
+  ])
+  return hex === null ? null : try parseQuantityHex(hex)
+}
+
+export effect function getBlockTransactionCountByNumber(
+  block: BlockSelector = "latest",
+): (bigint | null)!(TransportError | CodecError)!Transport {
+  const transport = try Transport
+  const hex = try transport.request<QuantityHex | null>("eth_getBlockTransactionCountByNumber", [
+    formatBlockSelector(block),
+  ])
+  return hex === null ? null : try parseQuantityHex(hex)
+}
+
+export effect function getTransactionByHash(
+  txHash: Hash32,
+): (TransactionObject | null)!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<TransactionObject | null>("eth_getTransactionByHash", [txHash])
+}
+
+export effect function getTransactionByBlockHashAndIndex(
+  blockHash: Hash32,
+  index: number | bigint,
+): (TransactionObject | null)!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<TransactionObject | null>("eth_getTransactionByBlockHashAndIndex", [
+    blockHash,
+    toQuantityHex(index),
+  ])
+}
+
+export effect function getTransactionByBlockNumberAndIndex(
+  block: BlockSelector,
+  index: number | bigint,
+): (TransactionObject | null)!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<TransactionObject | null>(
+    "eth_getTransactionByBlockNumberAndIndex",
+    [formatBlockSelector(block), toQuantityHex(index)],
+  )
+}
+
+export effect function getTransactionReceipt(
+  txHash: Hash32,
+): (ReceiptObject | null)!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<ReceiptObject | null>("eth_getTransactionReceipt", [txHash])
+}
+
+export interface WaitForReceiptOptions {
+  readonly pollInterval?: Duration.Input
+  readonly maxAttempts?: number
+}
+
+/**
+ * Poll `eth_getTransactionReceipt` using Effect Clock until mined or maxAttempts reached.
+ * Deterministic under `TestClock` in tests!
+ */
+export effect function waitForTransactionReceipt(
+  txHash: Hash32,
+  options: WaitForReceiptOptions = {},
+): ReceiptObject!(TransportError | ReceiptTimeoutError)!Transport {
+  const pollInterval = options.pollInterval ?? "100 millis"
+  const maxAttempts = options.maxAttempts ?? 120
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const receipt = try getTransactionReceipt(txHash)
+    if (receipt !== null) return receipt
+    if (attempt + 1 < maxAttempts) {
+      try sleep(pollInterval)
+    }
+  }
+  throw new ReceiptTimeoutError({
+    txHash,
+    message: `Transaction receipt not found for ${txHash} after ${maxAttempts} attempts`,
+  })
+}
+
+export effect function getBlockReceipts(
+  block: BlockSelector = "latest",
+): (readonly ReceiptObject[] | null)!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<readonly ReceiptObject[] | null>("eth_getBlockReceipts", [
+    formatBlockSelector(block),
+  ])
+}
+
+export function formatLogFilter(filter: LogFilter): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  if (filter.blockHash !== undefined) {
+    out["blockHash"] = filter.blockHash
+  } else {
+    if (filter.fromBlock !== undefined) out["fromBlock"] = formatBlockSelector(filter.fromBlock)
+    if (filter.toBlock !== undefined) out["toBlock"] = formatBlockSelector(filter.toBlock)
+  }
+  if (filter.address !== undefined) out["address"] = filter.address
+  if (filter.topics !== undefined) out["topics"] = filter.topics
+  return out
+}
+
+export effect function getLogs(filter: LogFilter): (readonly LogObject[])!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<readonly LogObject[]>("eth_getLogs", [formatLogFilter(filter)])
+}
+
+// Utility & TxPool
+
+export effect function getClientVersion(): string!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<string>("web3_clientVersion")
+}
+
+export effect function sha3(data: Hex): Hash32!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Hash32>("web3_sha3", [data])
+}
+
+export effect function getNetVersion(): string!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<string>("net_version")
+}
+
+export effect function isMining(): boolean!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<boolean>("eth_mining")
+}
+
+export effect function getTxPoolContent(): TxPoolContent!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<TxPoolContent>("txpool_content")
+}
+
+export effect function getTxPoolContentFrom(address: Address): TxPoolContent!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<TxPoolContent>("txpool_contentFrom", [address])
+}
+
+export effect function getTxPoolStatus(): TxPoolStatus!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<TxPoolStatus>("txpool_status")
+}

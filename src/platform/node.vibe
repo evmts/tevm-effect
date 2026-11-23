@@ -1,0 +1,165 @@
+// Node.js ZevmBackend Layer wrapping the native @evmts/zevm N-API bindings.
+// Every NativeNode and LightClient handle is managed via Effect acquireRelease
+// so native Zig memory is always freed when the enclosing Scope closes.
+
+import { ZevmBindingError } from "../errors.vibe"
+import {
+  type LightClientConfig,
+  type NativeNodeConfig,
+  ZevmBackend,
+  type ZevmLightClientHandle,
+  type ZevmNodeHandle,
+} from "../services/backend.vibe"
+import type { Address, Bytes32, Hex, QuantityHex } from "../types.vibe"
+import {
+  lightStatusCodeToName,
+  loadZevmModule,
+  networkNameToCode,
+  type NodeZevmBackendOptions,
+} from "./node-backend.ts"
+
+export type { NodeZevmBackendOptions }
+
+/**
+ * Node.js `ZevmBackend` Layer backed by the native `@evmts/zevm` N-API addon.
+ * Acquiring a node or light client registers an Effect finalizer that calls `.close()`
+ * automatically on scope exit, error, or fiber interruption.
+ */
+export function ZevmBackendNode(options: NodeZevmBackendOptions = {}) {
+  return Layer.effect(
+    ZevmBackend,
+    effect {
+      const mod = try tryPromise({
+        try: () => loadZevmModule(options),
+        catch: (cause) =>
+          new ZevmBindingError({
+            reason: cause instanceof Error ? cause.message : "Failed to load @evmts/zevm native module",
+            cause,
+          }),
+      })
+
+      return {
+        name: "zevm-node-napi",
+        effect version() {
+          return try Effect.try({
+            try: () => mod.version(),
+            catch: (cause) => new ZevmBindingError({ reason: "Failed to query ZEVM version", cause }),
+          })
+        },
+        effect abiVersion() {
+          return try Effect.try({
+            try: () => mod.abiVersion(),
+            catch: (cause) => new ZevmBindingError({ reason: "Failed to query ZEVM ABI version", cause }),
+          })
+        },
+        effect createNode(config: NativeNodeConfig) {
+          const nativeConfig: { chain_id?: number } = {}
+          if (config.chainId !== undefined) nativeConfig.chain_id = config.chainId
+
+          const rawNode = try acquireRelease(
+            Effect.try({
+              try: () => new mod.NativeNode(nativeConfig),
+              catch: (cause) =>
+                new ZevmBindingError({
+                  reason: cause instanceof Error ? cause.message : "Failed to create ZEVM NativeNode",
+                  cause,
+                }),
+            }),
+            (node) =>
+              Effect.sync(() => {
+                node.close()
+              }),
+          )
+
+          const handle: ZevmNodeHandle = {
+            effect rpc(rawJson: string) {
+              return try Effect.try({
+                try: () => rawNode.rpc(rawJson),
+                catch: (cause) =>
+                  new ZevmBindingError({
+                    reason: cause instanceof Error ? cause.message : "ZEVM NativeNode.rpc threw",
+                    cause,
+                  }),
+              })
+            },
+            effect close() {
+              try sync(() => {
+                rawNode.close()
+              })
+            },
+          }
+          return handle
+        },
+        effect createLightClient(config: LightClientConfig) {
+          const netCode = networkNameToCode(config.network)
+          const rawLight = try acquireRelease(
+            Effect.try({
+              try: () => new mod.LightClient(netCode, config.beaconRpcUrl, config.executionRpcUrl),
+              catch: (cause) =>
+                new ZevmBindingError({
+                  reason: cause instanceof Error ? cause.message : "Failed to create ZEVM LightClient",
+                  cause,
+                }),
+            }),
+            (client) =>
+              Effect.sync(() => {
+                client.close()
+              }),
+          )
+
+          const handle: ZevmLightClientHandle = {
+            effect syncStep() {
+              return try Effect.try({
+                try: () => rawLight.syncStep(),
+                catch: (cause) => new ZevmBindingError({ reason: "LightClient.syncStep failed", cause }),
+              })
+            },
+            effect status() {
+              const code = try Effect.try({
+                try: () => rawLight.status(),
+                catch: (cause) => new ZevmBindingError({ reason: "LightClient.status failed", cause }),
+              })
+              return lightStatusCodeToName(code)
+            },
+            effect lastError() {
+              return try Effect.try({
+                try: () => rawLight.lastError(),
+                catch: (cause) => new ZevmBindingError({ reason: "LightClient.lastError failed", cause }),
+              })
+            },
+            effect getBalance(address: Address, blockNumber: number = 0) {
+              return (try Effect.try({
+                try: () => rawLight.getBalance(address, blockNumber),
+                catch: (cause) => new ZevmBindingError({ reason: "LightClient.getBalance failed", cause }),
+              })) as QuantityHex
+            },
+            effect getTransactionCount(address: Address, blockNumber: number = 0) {
+              return (try Effect.try({
+                try: () => rawLight.getTransactionCount(address, blockNumber),
+                catch: (cause) => new ZevmBindingError({ reason: "LightClient.getTransactionCount failed", cause }),
+              })) as QuantityHex
+            },
+            effect getCode(address: Address, blockNumber: number = 0) {
+              return (try Effect.try({
+                try: () => rawLight.getCode(address, blockNumber),
+                catch: (cause) => new ZevmBindingError({ reason: "LightClient.getCode failed", cause }),
+              })) as Hex
+            },
+            effect getStorage(address: Address, slot: Bytes32, blockNumber: number = 0) {
+              return (try Effect.try({
+                try: () => rawLight.getStorage(address, slot, blockNumber),
+                catch: (cause) => new ZevmBindingError({ reason: "LightClient.getStorage failed", cause }),
+              })) as Bytes32
+            },
+            effect close() {
+              try sync(() => {
+                rawLight.close()
+              })
+            },
+          }
+          return handle
+        },
+      }
+    },
+  )
+}

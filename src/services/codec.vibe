@@ -1,0 +1,298 @@
+// AbiCodec service: dependency-injected ABI encoding, decoding, and keccak256 seam.
+// This is the clean integration point for voltaire-effect v2:
+//   - Swap in `VoltaireAbiCodec` once voltaire-effect v2 lands (zero changes to actions!)
+//   - Or use `AbiCodecRpcKeccak` / custom codecs immediately without blocking on Voltaire.
+
+import { CodecError } from "../errors.vibe"
+import type { Abi, DecodedEventLog, Hash32, Hex, LogObject } from "../types.vibe"
+import { Transport } from "./transport.vibe"
+
+export service AbiCodec {
+  static readonly key = "@tevm/effect/AbiCodec"
+  readonly encodeFunctionData: (
+    abi: Abi,
+    functionName: string,
+    args?: readonly unknown[],
+  ) => Hex!CodecError
+  readonly decodeFunctionResult: (
+    abi: Abi,
+    functionName: string,
+    data: Hex,
+  ) => unknown!CodecError
+  readonly encodeDeployData: (
+    abi: Abi,
+    bytecode: Hex,
+    args?: readonly unknown[],
+  ) => Hex!CodecError
+  readonly decodeEventLog: (
+    abi: Abi,
+    log: LogObject,
+  ) => DecodedEventLog!CodecError
+  readonly keccak256: (data: Hex) => Hash32!CodecError
+}
+
+/** Helper to normalize a 32-byte ABI word from a bigint, number, boolean, or hex string. */
+effect function encodeWord(typeName: string, value: unknown): string!CodecError {
+  if (typeName === "address") {
+    if (typeof value !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(value)) {
+      throw new CodecError({
+        operation: "encodeWord",
+        message: `Expected 20-byte hex address, received ${String(value)}`,
+      })
+    }
+    return value.slice(2).toLowerCase().padStart(64, "0")
+  }
+  if (typeName === "bool") {
+    return value ? "1".padStart(64, "0") : "0".padStart(64, "0")
+  }
+  if (typeName.startsWith("uint")) {
+    let hex: string
+    if (typeof value === "bigint") {
+      if (value < 0n) {
+        throw new CodecError({ operation: "encodeWord", message: `Negative value for ${typeName}` })
+      }
+      hex = value.toString(16)
+    } else if (typeof value === "number") {
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new CodecError({ operation: "encodeWord", message: `Invalid uint number: ${value}` })
+      }
+      hex = value.toString(16)
+    } else if (typeof value === "string" && /^0x[0-9a-fA-F]+$/.test(value)) {
+      hex = value.slice(2)
+    } else {
+      throw new CodecError({
+        operation: "encodeWord",
+        message: `Unsupported ${typeName} argument: ${String(value)}`,
+      })
+    }
+    if (hex.length > 64) {
+      throw new CodecError({ operation: "encodeWord", message: `Value overflows 32 bytes for ${typeName}` })
+    }
+    return hex.padStart(64, "0")
+  }
+  if (typeName === "bytes32") {
+    if (typeof value !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(value)) {
+      throw new CodecError({
+        operation: "encodeWord",
+        message: `Expected 32-byte hex for bytes32, received ${String(value)}`,
+      })
+    }
+    return value.slice(2).toLowerCase()
+  }
+  throw new CodecError({
+    operation: "encodeWord",
+    message: `Type "${typeName}" requires VoltaireAbiCodec (voltaire-effect v2) for full dynamic ABI encoding`,
+  })
+}
+
+effect function decodeWord(typeName: string, wordHex: string): unknown!CodecError {
+  if (typeName === "address") {
+    return `0x${wordHex.slice(24)}` as Hex
+  }
+  if (typeName === "bool") {
+    return wordHex !== "0".repeat(64)
+  }
+  if (typeName.startsWith("uint")) {
+    return try Effect.try({
+      try: () => BigInt(`0x${wordHex}`),
+      catch: (cause) =>
+        new CodecError({
+          operation: "decodeWord",
+          message: `Failed to decode ${typeName} from 0x${wordHex}`,
+          cause,
+        }),
+    })
+  }
+  if (typeName === "bytes32") {
+    return `0x${wordHex}` as Hex
+  }
+  throw new CodecError({
+    operation: "decodeWord",
+    message: `Type "${typeName}" requires VoltaireAbiCodec (voltaire-effect v2) for full dynamic ABI decoding`,
+  })
+}
+
+interface AbiParam {
+  readonly name?: string
+  readonly type: string
+}
+
+interface AbiFunctionItem {
+  readonly type: string
+  readonly name?: string
+  readonly inputs?: readonly AbiParam[]
+  readonly outputs?: readonly AbiParam[]
+}
+
+function findAbiFunction(abi: Abi, functionName: string): AbiFunctionItem | undefined {
+  for (const raw of abi) {
+    const item = raw as unknown as AbiFunctionItem
+    if (item.type === "function" && item.name === functionName) {
+      return item
+    }
+  }
+  return undefined
+}
+
+function findAbiConstructor(abi: Abi): AbiFunctionItem | undefined {
+  for (const raw of abi) {
+    const item = raw as unknown as AbiFunctionItem
+    if (item.type === "constructor") {
+      return item
+    }
+  }
+  return undefined
+}
+
+function buildSignature(name: string, inputs: readonly AbiParam[]): string {
+  return `${name}(${inputs.map((i) => i.type).join(",")})`
+}
+
+function utf8HexOfSignature(sig: string): Hex {
+  const bytes = new TextEncoder().encode(sig)
+  let hex = "0x"
+  for (const b of bytes) {
+    hex += b.toString(16).padStart(2, "0")
+  }
+  return hex as Hex
+}
+
+/**
+ * Built-in static ABI codec backed by ZEVM's own `web3_sha3` RPC method for Keccak-256.
+ * Supports static ABI types (`address`, `bool`, `uint*`, `bytes32`) right out of the box
+ * with zero external crypto dependencies — and can be swapped 1-for-1 with `VoltaireAbiCodec`
+ * for full dynamic tuples, strings, arrays, and EIP-712 once voltaire-effect v2 is ready.
+ */
+export const AbiCodecZevm = Layer.effect(
+  AbiCodec,
+  effect {
+    const transport = try Transport
+
+    effect function keccak256(data: Hex): Hash32!CodecError {
+      return try Effect.mapError(
+        transport.request<Hash32>("web3_sha3", [data]),
+        (cause) =>
+          new CodecError({
+            operation: "keccak256",
+            message: cause.message,
+            cause,
+          }),
+      )
+    }
+
+    return {
+      keccak256,
+      effect encodeFunctionData(abi: Abi, functionName: string, args: readonly unknown[] = []) {
+        const fn = findAbiFunction(abi, functionName)
+        if (fn === undefined) {
+          throw new CodecError({
+            operation: "encodeFunctionData",
+            message: `Function "${functionName}" not found in ABI`,
+          })
+        }
+        const inputs = fn.inputs ?? []
+        if (args.length !== inputs.length) {
+          throw new CodecError({
+            operation: "encodeFunctionData",
+            message: `Function "${functionName}" expects ${inputs.length} arguments, got ${args.length}`,
+          })
+        }
+        const sig = buildSignature(functionName, inputs)
+        const hash = try keccak256(utf8HexOfSignature(sig))
+        const selector = hash.slice(0, 10)
+        let encodedArgs = ""
+        for (let i = 0; i < inputs.length; i++) {
+          encodedArgs += try encodeWord(inputs[i].type, args[i])
+        }
+        return `${selector}${encodedArgs}` as Hex
+      },
+      effect decodeFunctionResult(abi: Abi, functionName: string, data: Hex) {
+        const fn = findAbiFunction(abi, functionName)
+        if (fn === undefined) {
+          throw new CodecError({
+            operation: "decodeFunctionResult",
+            message: `Function "${functionName}" not found in ABI`,
+          })
+        }
+        const outputs = fn.outputs ?? []
+        if (outputs.length === 0) return undefined
+        const body = data.startsWith("0x") ? data.slice(2) : data
+        if (body.length < outputs.length * 64) {
+          throw new CodecError({
+            operation: "decodeFunctionResult",
+            message: `Return data too short (${body.length} hex chars) for ${outputs.length} outputs`,
+          })
+        }
+        const decoded: unknown[] = []
+        for (let i = 0; i < outputs.length; i++) {
+          const word = body.slice(i * 64, (i + 1) * 64)
+          decoded.push(try decodeWord(outputs[i].type, word))
+        }
+        return outputs.length === 1 ? decoded[0] : decoded
+      },
+      effect encodeDeployData(abi: Abi, bytecode: Hex, args: readonly unknown[] = []) {
+        const ctor = findAbiConstructor(abi)
+        const inputs = ctor?.inputs ?? []
+        if (args.length !== inputs.length) {
+          throw new CodecError({
+            operation: "encodeDeployData",
+            message: `Constructor expects ${inputs.length} arguments, got ${args.length}`,
+          })
+        }
+        let encodedArgs = ""
+        for (let i = 0; i < inputs.length; i++) {
+          encodedArgs += try encodeWord(inputs[i].type, args[i])
+        }
+        return `${bytecode}${encodedArgs}` as Hex
+      },
+      effect decodeEventLog(abi: Abi, log: LogObject) {
+        if (log.topics.length === 0) {
+          throw new CodecError({
+            operation: "decodeEventLog",
+            message: "Cannot decode anonymous event log with no topics",
+          })
+        }
+        const topic0 = log.topics[0].toLowerCase()
+        for (const raw of abi) {
+          const item = raw as unknown as AbiFunctionItem & {
+            readonly inputs?: readonly (AbiParam & { readonly indexed?: boolean })[]
+          }
+          if (item.type !== "event" || item.name === undefined) continue
+          const inputs = item.inputs ?? []
+          const sig = buildSignature(item.name, inputs)
+          const hash = try keccak256(utf8HexOfSignature(sig))
+          if (hash.toLowerCase() !== topic0) continue
+
+          const decodedArgs: Record<string, unknown> = {}
+          const dataBody = log.data.startsWith("0x") ? log.data.slice(2) : log.data
+          let topicIndex = 1
+          let dataWordIndex = 0
+          for (let i = 0; i < inputs.length; i++) {
+            const input = inputs[i]
+            const key = input.name ?? String(i)
+            if (input.indexed) {
+              const topic = log.topics[topicIndex]
+              topicIndex++
+              if (topic !== undefined) {
+                decodedArgs[key] = try decodeWord(input.type, topic.slice(2))
+              }
+            } else {
+              const word = dataBody.slice(dataWordIndex * 64, (dataWordIndex + 1) * 64)
+              dataWordIndex++
+              decodedArgs[key] = try decodeWord(input.type, word)
+            }
+          }
+          return {
+            eventName: item.name,
+            args: decodedArgs,
+            raw: log,
+          }
+        }
+        throw new CodecError({
+          operation: "decodeEventLog",
+          message: `No matching event found in ABI for topic0 ${topic0}`,
+        })
+      },
+    }
+  },
+)

@@ -1,0 +1,104 @@
+// Voltaire integration boundary for voltaire-effect v2.
+// Defines structural adapter interfaces so tevm-effect plugs straight into
+// voltaire-effect's AbiEncoder, Keccak256, and TransportService Layers with
+// zero changes to tevm-effect actions, streams, or services.
+
+import { CodecError, TransportError } from "../errors.vibe"
+import { AbiCodec } from "../services/codec.vibe"
+import { Transport } from "../services/transport.vibe"
+import type { Abi, DecodedEventLog, Hash32, Hex, LogObject } from "../types.vibe"
+
+/**
+ * Structural adapter shape matching voltaire-effect's ABI + Keccak256 primitives/services.
+ * Pass voltaire-effect v2's services directly into `VoltaireAbiCodec(adapter)`.
+ */
+export interface VoltaireCodecAdapter {
+  readonly encodeFunctionData: (abi: Abi, functionName: string, args?: readonly unknown[]) => Hex!unknown
+  readonly decodeFunctionResult: (abi: Abi, functionName: string, data: Hex) => unknown!unknown
+  readonly encodeDeployData: (abi: Abi, bytecode: Hex, args?: readonly unknown[]) => Hex!unknown
+  readonly decodeEventLog: (abi: Abi, log: LogObject) => DecodedEventLog!unknown
+  readonly keccak256: (data: Hex) => Hash32!unknown
+}
+
+/**
+ * Build an `AbiCodec` Layer from a `voltaire-effect` adapter.
+ * Maps any Voltaire codec error into tevm-effect's typed `CodecError`.
+ */
+export function VoltaireAbiCodec(adapter: VoltaireCodecAdapter) {
+  return Layer.succeed(AbiCodec, {
+    effect encodeFunctionData(abi: Abi, functionName: string, args?: readonly unknown[]) {
+      return try Effect.mapError(
+        adapter.encodeFunctionData(abi, functionName, args),
+        (cause) =>
+          new CodecError({
+            operation: "voltaire.encodeFunctionData",
+            message: cause instanceof Error ? cause.message : String(cause),
+            cause,
+          }),
+      )
+    },
+    effect decodeFunctionResult(abi: Abi, functionName: string, data: Hex) {
+      return try Effect.mapError(
+        adapter.decodeFunctionResult(abi, functionName, data),
+        (cause) =>
+          new CodecError({
+            operation: "voltaire.decodeFunctionResult",
+            message: cause instanceof Error ? cause.message : String(cause),
+            cause,
+          }),
+      )
+    },
+    effect encodeDeployData(abi: Abi, bytecode: Hex, args?: readonly unknown[]) {
+      return try Effect.mapError(
+        adapter.encodeDeployData(abi, bytecode, args),
+        (cause) =>
+          new CodecError({
+            operation: "voltaire.encodeDeployData",
+            message: cause instanceof Error ? cause.message : String(cause),
+            cause,
+          }),
+      )
+    },
+    effect decodeEventLog(abi: Abi, log: LogObject) {
+      return try Effect.mapError(
+        adapter.decodeEventLog(abi, log),
+        (cause) =>
+          new CodecError({
+            operation: "voltaire.decodeEventLog",
+            message: cause instanceof Error ? cause.message : String(cause),
+            cause,
+          }),
+      )
+    },
+    effect keccak256(data: Hex) {
+      return try Effect.mapError(
+        adapter.keccak256(data),
+        (cause) =>
+          new CodecError({
+            operation: "voltaire.keccak256",
+            message: cause instanceof Error ? cause.message : String(cause),
+            cause,
+          }),
+      )
+    },
+  })
+}
+
+/**
+ * Structural shape matching voltaire-effect's `TransportService` (`request(method, params?)`).
+ * Allows any `tevm-effect` `Transport` (including in-process `Evm`) to power
+ * `voltaire-effect`'s `Provider`, `Signer`, `Contract`, and `BlockStream` services!
+ */
+export interface VoltaireTransportShape {
+  readonly request: <T>(method: string, params?: unknown[]) => T!TransportError
+}
+
+/** Extract a voltaire-effect-compatible transport shape from tevm-effect's injected `Transport`. */
+export effect function toVoltaireTransport(): VoltaireTransportShape!never!Transport {
+  const transport = try Transport
+  return {
+    effect request<T>(method: string, params?: unknown[]) {
+      return try transport.request<T>(method, params)
+    },
+  }
+}

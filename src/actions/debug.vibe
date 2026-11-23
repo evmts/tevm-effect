@@ -1,0 +1,48 @@
+// Debug and raw inspection actions backed by injected Transport.
+
+import { TransportError } from "../errors.vibe"
+import { formatBlockSelector, formatTransactionRequest } from "../hex.vibe"
+import { Transport } from "../services/transport.vibe"
+import type { BlockSelector, Hash32, Hex, TraceOptions, TraceResult, TransactionRequest } from "../types.vibe"
+
+export effect function debugTraceCall(
+  tx: TransactionRequest,
+  block?: BlockSelector,
+  options?: TraceOptions,
+): TraceResult!TransportError!Transport {
+  const transport = try Transport
+  const params: unknown[] = [formatTransactionRequest(tx), formatBlockSelector(block)]
+  if (options !== undefined) {
+    params.push(options)
+  }
+  return try transport.request<TraceResult>("debug_traceCall", params)
+}
+
+export effect function debugGetBadBlocks(): (readonly unknown[])!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<readonly unknown[]>("debug_getBadBlocks")
+}
+
+export effect function debugGetRawBlock(block: BlockSelector): (Hex | null)!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Hex | null>("debug_getRawBlock", [formatBlockSelector(block)])
+}
+
+export effect function debugGetRawHeader(block: BlockSelector): (Hex | null)!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Hex | null>("debug_getRawHeader", [formatBlockSelector(block)])
+}
+
+export effect function debugGetRawReceipts(
+  block: BlockSelector,
+): (readonly Hex[] | null)!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<readonly Hex[] | null>("debug_getRawReceipts", [
+    formatBlockSelector(block),
+  ])
+}
+
+export effect function debugGetRawTransaction(txHash: Hash32): (Hex | null)!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Hex | null>("debug_getRawTransaction", [txHash])
+}

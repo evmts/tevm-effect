@@ -1,0 +1,236 @@
+import { assert, describe, it } from "@effect/vitest"
+import { TestClock } from "effect/testing"
+import {
+  AnvilCommon,
+  deployContract,
+  getBalance,
+  getBlockNumber,
+  getCode,
+  getStorageAt,
+  getTransactionCount,
+  LightClient,
+  LightClientLive,
+  readContract,
+  sendTransaction,
+  tevmAddBalance,
+  tevmCall,
+  tevmDumpStateDecoded,
+  tevmGetAccount,
+  tevmGetAutomine,
+  tevmLoadStateDecoded,
+  tevmMine,
+  tevmMineDetailed,
+  tevmMetadata,
+  tevmNodeInfo,
+  tevmRevert,
+  tevmSetAccount,
+  tevmSetAutomine,
+  tevmSetBalance,
+  TevmCoreLive,
+  waitForTransactionReceipt,
+  withImpersonation,
+  withSnapshot,
+} from "../index.vibe"
+import { DEFAULT_DEV_ACCOUNTS, ZevmBackendMemory } from "../testing/index.vibe"
+
+const MemoryTevm = Layer.provideMerge(
+  TevmCoreLive,
+  Layer.merge(AnvilCommon, ZevmBackendMemory),
+)
+
+describe("Eth & Tevm Actions", () => {
+  it.effect("manipulates account balance, nonce, code, and storage", effect () => {
+    provide MemoryTevm {
+      const addr = "0x000000000000000000000000000000000000cafe" as const
+      const slot = "0x0000000000000000000000000000000000000000000000000000000000000001" as const
+      const val = "0x000000000000000000000000000000000000000000000000000000000000002a" as const
+
+      try tevmSetAccount({
+        address: addr,
+        balance: 500n,
+        nonce: 7,
+        code: "0x602a60005260206000f3",
+        storage: { [slot]: val },
+      })
+      try tevmAddBalance(addr, 250n)
+
+      const account = try tevmGetAccount(addr)
+      const stored = try getStorageAt(addr, slot)
+      const code = try getCode(addr)
+      const txCount = try getTransactionCount(addr)
+
+      try Effect.try(() => assert.strictEqual(account.balance, 750n))
+      try Effect.try(() => assert.strictEqual(account.nonce, 7n))
+      try Effect.try(() => assert.strictEqual(account.code, "0x602a60005260206000f3"))
+      try Effect.try(() => assert.strictEqual(stored, val))
+      try Effect.try(() => assert.strictEqual(code, "0x602a60005260206000f3"))
+      try Effect.try(() => assert.strictEqual(txCount, 7n))
+    }
+  })
+
+  it.effect("mines blocks and reports metadata & nodeInfo", effect () => {
+    provide MemoryTevm {
+      const autoBefore = try tevmGetAutomine()
+      try Effect.try(() => assert.strictEqual(autoBefore, true))
+      try tevmSetAutomine(false)
+      const autoAfter = try tevmGetAutomine()
+      try Effect.try(() => assert.strictEqual(autoAfter, false))
+
+      const mined = try tevmMineDetailed({ blocks: 3, intervalSeconds: 12 })
+      const head = try getBlockNumber()
+      try Effect.try(() => assert.strictEqual(mined.length, 3))
+      try Effect.try(() => assert.strictEqual(head, 3n))
+
+      const meta = try tevmMetadata()
+      const info = try tevmNodeInfo()
+      try Effect.try(() => assert.strictEqual(meta.mode, "trusted"))
+      try Effect.try(() => assert.strictEqual(info.mining.type, "manual"))
+      try Effect.try(() => assert.strictEqual(info.managedAccounts.length > 0, true))
+    }
+  })
+
+  it.effect("automatically reverts state via scoped withSnapshot on success AND failure", effect () => {
+    error Boom
+
+    provide MemoryTevm {
+      const addr = "0x000000000000000000000000000000000000babe" as const
+      try tevmSetBalance(addr, 100n)
+
+      // 1. Normal completion reverts
+      const computed = try withSnapshot(
+        effect {
+          try tevmSetBalance(addr, 9999n)
+          const inside = try getBalance(addr)
+          try Effect.try(() => assert.strictEqual(inside, 9999n))
+          return "ok"
+        },
+      )
+      const afterSuccess = try getBalance(addr)
+      try Effect.try(() => assert.strictEqual(computed, "ok"))
+      try Effect.try(() => assert.strictEqual(afterSuccess, 100n))
+
+      // 2. Typed failure also reverts cleanly
+      const caughtTag = withSnapshot(
+        effect {
+          try tevmSetBalance(addr, 5555n)
+          throw new Boom()
+        },
+      ) catch (e) => e._tag
+      const afterFail = try getBalance(addr)
+      try Effect.try(() => assert.strictEqual(caughtTag, "Boom"))
+      try Effect.try(() => assert.strictEqual(afterFail, 100n))
+
+      // 3. Reverting an unknown snapshot fails with SnapshotNotFoundError
+      const badSnapTag = tevmRevert("0xdead") catch (e) => e._tag
+      try Effect.try(() => assert.strictEqual(badSnapTag, "SnapshotNotFoundError"))
+    }
+  })
+
+  it.effect("automatically cleans up impersonation via scoped withImpersonation", effect () => {
+    provide MemoryTevm {
+      const whale = "0x000000000000000000000000000000000000beef" as const
+      const recipient = DEFAULT_DEV_ACCOUNTS[2]
+      try tevmSetBalance(whale, 10_000n)
+
+      // Rejected before impersonation
+      const beforeTag = sendTransaction({ from: whale, to: recipient, value: 10n }) catch (e) => e._tag
+      try Effect.try(() => assert.strictEqual(beforeTag, "TransportError"))
+
+      // Succeeds inside scoped impersonation
+      try withImpersonation(
+        whale,
+        effect {
+          const hash = try sendTransaction({ from: whale, to: recipient, value: 250n })
+          try Effect.try(() => assert.strictEqual(hash.startsWith("0x"), true))
+        },
+      )
+
+      // Rejected again automatically after scope exits
+      const afterTag = sendTransaction({ from: whale, to: recipient, value: 10n }) catch (e) => e._tag
+      try Effect.try(() => assert.strictEqual(afterTag, "TransportError"))
+    }
+  })
+
+  it.effect("waits for transaction receipts deterministically using TestClock", effect () => {
+    provide MemoryTevm {
+      try tevmSetAutomine(false)
+      const txHash = try sendTransaction({
+        from: DEFAULT_DEV_ACCOUNTS[0],
+        to: DEFAULT_DEV_ACCOUNTS[1],
+        value: 42n,
+      })
+
+      const waiter = fork waitForTransactionReceipt(txHash, { pollInterval: "100 millis", maxAttempts: 10 })
+      try TestClock.adjust("100 millis")
+      try tevmMine({ blocks: 1 })
+      try TestClock.adjust("100 millis")
+
+      const receipt = try join waiter
+      try Effect.try(() => assert.strictEqual(receipt.transactionHash, txHash))
+      try Effect.try(() => assert.strictEqual(receipt.status, "0x1"))
+    }
+  })
+
+  it.effect("dumps and restores decoded state objects and executes contract actions", effect () => {
+    const simpleAbi = [
+      {
+        type: "function",
+        name: "value",
+        inputs: [],
+        outputs: [{ name: "", type: "uint256" }],
+      },
+    ] as const
+
+    provide MemoryTevm {
+      const deployed = try deployContract({
+        abi: simpleAbi,
+        bytecode: "0x000000000000000000000000000000000000000000000000000000000000002a",
+      })
+      try Effect.try(() => assert.strictEqual(deployed.contractAddress !== null, true))
+
+      if (deployed.contractAddress !== null) {
+        const result = try readContract<bigint>({
+          address: deployed.contractAddress,
+          abi: simpleAbi,
+          functionName: "value",
+        })
+        try Effect.try(() => assert.strictEqual(result, 42n))
+      }
+
+      const dump = try tevmDumpStateDecoded()
+      try Effect.try(() => assert.strictEqual(dump.version, 1))
+      const loaded = try tevmLoadStateDecoded(dump)
+      try Effect.try(() => assert.strictEqual(loaded, true))
+
+      const callRes = try tevmCall({
+        to: DEFAULT_DEV_ACCOUNTS[1],
+        value: 100n,
+        addToBlockchain: true,
+      })
+      try Effect.try(() => assert.strictEqual(callRes.txHash !== undefined, true))
+      try Effect.try(() => assert.strictEqual(callRes.receipt !== null, true))
+    }
+  })
+
+  it.effect("streams LightClient sync progression and performs proof-backed reads", effect () => {
+    const LightLayer = Layer.provide(
+      LightClientLive({
+        network: "mainnet",
+        beaconRpcUrl: "http://beacon.local",
+        executionRpcUrl: "http://exec.local",
+      }),
+      ZevmBackendMemory,
+    )
+
+    provide LightLayer {
+      const light = try LightClient
+      const syncFiber = fork Stream.runCollect(light.syncStream("10 millis"))
+      try TestClock.adjust("50 millis")
+      const steps = try join syncFiber
+      try Effect.try(() => assert.strictEqual(steps.length, 2))
+      try Effect.try(() => assert.strictEqual(steps[1]?.status, "synced"))
+      const bal = try light.getBalance(DEFAULT_DEV_ACCOUNTS[0])
+      try Effect.try(() => assert.strictEqual(bal > 0n, true))
+    }
+  })
+})

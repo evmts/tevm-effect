@@ -1,0 +1,103 @@
+// Platform-agnostic HTTP JSON-RPC Server built with Effect 4 `effect/http`.
+// Depends ONLY on the injected `Transport` service — zero `node:http` imports!
+// Runs on Node (`NodeHttpServer`), Bun (`BunHttpServer`), Workers, or in-memory
+// via `HttpRouter.toHttpEffect` without opening a socket.
+
+import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
+import { parseJson } from "../hex.vibe"
+import { Transport } from "../services/transport.vibe"
+
+export interface JsonRpcHttpServerOptions {
+  /** Mount path for JSON-RPC POST requests. Defaults to "/". */
+  readonly path?: `/${string}`
+  /** Maximum request body size in UTF-8 bytes. Defaults to 8,388,608 (ZEVM contract). */
+  readonly maxBodySize?: number
+  /** Maximum JSON-RPC batch size. Optional. */
+  readonly maxBatchSize?: number
+  /** Enable permissive CORS headers and OPTIONS preflight handling. */
+  readonly cors?: boolean
+}
+
+const DEFAULT_MAX_BODY_SIZE = 8_388_608
+
+function withCorsHeaders(response: HttpServerResponse.HttpServerResponse, cors: boolean) {
+  if (!cors) return response
+  return response.pipe(
+    HttpServerResponse.setHeader("access-control-allow-origin", "*"),
+    HttpServerResponse.setHeader("access-control-allow-headers", "content-type"),
+    HttpServerResponse.setHeader("access-control-allow-methods", "POST, OPTIONS"),
+  )
+}
+
+/**
+ * Create an Effect `HttpRouter` serving JSON-RPC 2.0 requests over any injected `Transport`.
+ * Preserves exact ZEVM HTTP contract semantics:
+ *   - `204` for notification-only requests / batches
+ *   - `200 application/json` for JSON-RPC results and JSON-RPC error objects
+ *   - `413` when body exceeds `maxBodySize` or batch exceeds `maxBatchSize`
+ *   - `415` when Content-Type is not `application/json`
+ */
+export function makeJsonRpcHttpRouter(options: JsonRpcHttpServerOptions = {}) {
+  const path = options.path ?? "/"
+  const maxBodySize = options.maxBodySize ?? DEFAULT_MAX_BODY_SIZE
+  const cors = options.cors ?? false
+
+  const postHandler = effect {
+    const req = try HttpServerRequest.HttpServerRequest
+    const transport = try Transport
+
+    const contentType = req.headers["content-type"] ?? ""
+    if (!contentType.toLowerCase().startsWith("application/json")) {
+      return withCorsHeaders(HttpServerResponse.empty({ status: 415 }), cors)
+    }
+
+    const bodyText = req.text catch () => null
+    if (bodyText === null) {
+      return withCorsHeaders(HttpServerResponse.empty({ status: 400 }), cors)
+    }
+
+    const byteLength = new TextEncoder().encode(bodyText).byteLength
+    if (byteLength > maxBodySize) {
+      return withCorsHeaders(HttpServerResponse.empty({ status: 413 }), cors)
+    }
+
+    if (options.maxBatchSize !== undefined) {
+      const parsed = (parseJson(bodyText)) catch () => null
+      if (Array.isArray(parsed) && parsed.length > options.maxBatchSize) {
+        return withCorsHeaders(HttpServerResponse.empty({ status: 413 }), cors)
+      }
+    }
+
+    const rawResponse = (transport.rpc(bodyText)) catch effect (err) => {
+      const errorPayload = JSON.stringify({
+        jsonrpc: "2.0",
+        id: null,
+        error: {
+          code: err.code ?? -32603,
+          message: err.message,
+        },
+      })
+      return errorPayload
+    }
+
+    if (rawResponse === null) {
+      return withCorsHeaders(HttpServerResponse.empty({ status: 204 }), cors)
+    }
+
+    return withCorsHeaders(
+      HttpServerResponse.text(rawResponse, {
+        status: 200,
+        contentType: "application/json",
+      }),
+      cors,
+    )
+  }
+
+  const optionsHandler = effect {
+    return withCorsHeaders(HttpServerResponse.empty({ status: 204 }), cors)
+  }
+
+  const base = HttpRouter.add("POST", path, postHandler)
+  if (!cors) return base
+  return Layer.merge(base, HttpRouter.add("OPTIONS", path, optionsHandler))
+}

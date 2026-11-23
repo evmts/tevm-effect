@@ -1,0 +1,80 @@
+import { assert, describe, it } from "@effect/vitest"
+import { HttpClientRequest, HttpRouter, HttpServerRequest } from "effect/http"
+import { AnvilCommon, makeJsonRpcHttpRouter, TevmCoreLive } from "../index.vibe"
+import { ZevmBackendMemory } from "../testing/index.vibe"
+
+const MemoryTevm = Layer.provideMerge(
+  TevmCoreLive,
+  Layer.merge(AnvilCommon, ZevmBackendMemory),
+)
+
+function jsonPost(body: string, contentType: string = "application/json") {
+  let req = HttpClientRequest.post("http://local/")
+  req = HttpClientRequest.setHeader(req, "content-type", contentType)
+  req = HttpClientRequest.bodyText(req, body, contentType)
+  return HttpServerRequest.fromClientRequest(req)
+}
+
+describe("Platform-Agnostic Effect HTTP JSON-RPC Server", () => {
+  it.effect("handles single requests, batches, notifications, CORS, and HTTP error codes without a socket", effect () => {
+    const Routes = makeJsonRpcHttpRouter({
+      cors: true,
+      maxBodySize: 512,
+      maxBatchSize: 2,
+    })
+    const App = HttpRouter.provideRequest(MemoryTevm)(Routes)
+
+    try scoped(effect {
+      const app = try HttpRouter.toHttpEffect(App)
+
+      // Single JSON-RPC call -> 200
+      provide HttpServerRequest.HttpServerRequest = jsonPost('{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}') {
+        const singleRes = try app
+        try Effect.try(() => assert.strictEqual(singleRes.status, 200))
+        try Effect.try(() => assert.strictEqual(singleRes.headers["access-control-allow-origin"], "*"))
+      }
+
+      // Notification -> 204
+      provide HttpServerRequest.HttpServerRequest = jsonPost('{"jsonrpc":"2.0","method":"eth_chainId","params":[]}') {
+        const notifRes = try app
+        try Effect.try(() => assert.strictEqual(notifRes.status, 204))
+      }
+
+      // Batch within limit -> 200
+      provide HttpServerRequest.HttpServerRequest = jsonPost(
+        '[{"jsonrpc":"2.0","id":1,"method":"eth_chainId"},{"jsonrpc":"2.0","id":2,"method":"eth_blockNumber"}]',
+      ) {
+        const batchOk = try app
+        try Effect.try(() => assert.strictEqual(batchOk.status, 200))
+      }
+
+      // Batch exceeding maxBatchSize -> 413
+      provide HttpServerRequest.HttpServerRequest = jsonPost(
+        '[{"jsonrpc":"2.0","id":1,"method":"eth_chainId"},{"jsonrpc":"2.0","id":2,"method":"eth_chainId"},{"jsonrpc":"2.0","id":3,"method":"eth_chainId"}]',
+      ) {
+        const batchTooBig = try app
+        try Effect.try(() => assert.strictEqual(batchTooBig.status, 413))
+      }
+
+      // Wrong Content-Type -> 415
+      provide HttpServerRequest.HttpServerRequest = jsonPost('{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}', "text/plain") {
+        const badContentType = try app
+        try Effect.try(() => assert.strictEqual(badContentType.status, 415))
+      }
+
+      // Body exceeding maxBodySize -> 413
+      const hugeBody = `{"jsonrpc":"2.0","id":1,"method":"eth_chainId","pad":"${"a".repeat(600)}"}`
+      provide HttpServerRequest.HttpServerRequest = jsonPost(hugeBody) {
+        const tooLarge = try app
+        try Effect.try(() => assert.strictEqual(tooLarge.status, 413))
+      }
+
+      // OPTIONS preflight -> 204 with CORS headers
+      provide HttpServerRequest.HttpServerRequest = HttpServerRequest.fromClientRequest(HttpClientRequest.options("http://local/")) {
+        const preflight = try app
+        try Effect.try(() => assert.strictEqual(preflight.status, 204))
+        try Effect.try(() => assert.strictEqual(preflight.headers["access-control-allow-methods"], "POST, OPTIONS"))
+      }
+    })
+  })
+})
