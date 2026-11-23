@@ -1,0 +1,39 @@
+// Effect 4 Context.Reference configuration services for tevm-effect.
+// Mirrors voltaire-effect v2's zero-plumbing ambient config pattern:
+// every service has a safe defaultValue and can be overridden locally via `provide`.
+
+export service RpcTimeout: Duration.Input {
+  static readonly key = "@tevm/effect/config/RpcTimeout"
+  static readonly defaultValue = (): Duration.Input => "30 seconds"
+}
+
+export service RpcTracing: boolean {
+  static readonly key = "@tevm/effect/config/RpcTracing"
+  static readonly defaultValue = () => true
+}
+
+export service BlockPollInterval: Duration.Input {
+  static readonly key = "@tevm/effect/config/BlockPollInterval"
+  static readonly defaultValue = (): Duration.Input => "50 millis"
+}
+
+export service DefaultGasLimit: bigint {
+  static readonly key = "@tevm/effect/config/DefaultGasLimit"
+  static readonly defaultValue = () => 30_000_000n
+}
+
+export function withRpcTimeout(duration: Duration.Input) {
+  return Layer.succeed(RpcTimeout, duration)
+}
+
+export function withRpcTracing(enabled: boolean) {
+  return Layer.succeed(RpcTracing, enabled)
+}
+
+export function withBlockPollInterval(interval: Duration.Input) {
+  return Layer.succeed(BlockPollInterval, interval)
+}
+
+export function withDefaultGasLimit(limit: bigint) {
+  return Layer.succeed(DefaultGasLimit, limit)
+}

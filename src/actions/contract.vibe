@@ -137,3 +137,62 @@ export effect function getContractEvents(
   }
   return decoded
 }
+
+export interface BoundContract {
+  readonly address: Address
+  readonly abi: Abi
+  readonly read: <T = unknown>(
+    functionName: string,
+    args?: readonly unknown[],
+    overrides?: Omit<ReadContractParams, "address" | "abi" | "functionName" | "args">,
+  ) => T!(TransportError | CodecError)!(Transport | AbiCodec)
+  readonly write: <T = unknown>(
+    functionName: string,
+    args?: readonly unknown[],
+    overrides?: Omit<WriteContractParams, "address" | "abi" | "functionName" | "args">,
+  ) => ContractCallOutcome<T>!(TransportError | CodecError)!(Transport | AbiCodec)
+  readonly events: (
+    filter?: Omit<LogFilter, "address">,
+  ) => (readonly DecodedEventLog[])!(TransportError | CodecError)!(Transport | AbiCodec)
+}
+
+/**
+ * Bind an ABI + address into a lightweight, reusable contract handle whose methods
+ * remain pure Effects requiring `Transport | AbiCodec`.
+ * Swap `AbiCodecZevm` <-> `VoltaireAbiCodecLive` or backends at provide-time!
+ */
+export function bindContract(config: { readonly address: Address; readonly abi: Abi }): BoundContract {
+  return {
+    address: config.address,
+    abi: config.abi,
+    read<T = unknown>(
+      functionName: string,
+      args?: readonly unknown[],
+      overrides?: Omit<ReadContractParams, "address" | "abi" | "functionName" | "args">,
+    ) {
+      return readContract<T>({
+        ...overrides,
+        address: config.address,
+        abi: config.abi,
+        functionName,
+        args,
+      })
+    },
+    write<T = unknown>(
+      functionName: string,
+      args?: readonly unknown[],
+      overrides?: Omit<WriteContractParams, "address" | "abi" | "functionName" | "args">,
+    ) {
+      return writeContract<T>({
+        ...overrides,
+        address: config.address,
+        abi: config.abi,
+        functionName,
+        args,
+      })
+    },
+    events(filter: Omit<LogFilter, "address"> = {}) {
+      return getContractEvents(config.abi, { ...filter, address: config.address })
+    },
+  }
+}

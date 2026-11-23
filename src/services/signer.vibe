@@ -1,0 +1,113 @@
+// Signer service: aggressively dependency-injected transaction & message signing.
+// Supports:
+//   - SignerManagedAccount(index): binds to one of ZEVM's 10 deterministic dev accounts
+//   - SignerImpersonated(address): Effect-scoped impersonation (auto-stops on Scope exit!)
+//   - SignerCustom: plug in any hardware wallet, KMS, or voltaire-effect local signer
+
+import { getAccounts, sendTransaction, signMessage, signTransaction } from "../actions/eth.vibe"
+import { tevmImpersonateAccount, tevmStopImpersonatingAccount } from "../actions/tevm.vibe"
+import { InvalidConfigError, TransportError } from "../errors.vibe"
+import type { Address, Hash32, Hex, TransactionRequest } from "../types.vibe"
+import { Transport } from "./transport.vibe"
+
+export service Signer {
+  static readonly key = "@tevm/effect/Signer"
+  readonly address: Address
+  readonly signMessage: (data: Hex) => Hex!TransportError
+  readonly signTransaction: (tx: TransactionRequest) => Hex!TransportError
+  readonly sendTransaction: (tx: TransactionRequest) => Hash32!TransportError
+}
+
+/**
+ * Bind `Signer` to one of ZEVM's managed trusted accounts (default index 0).
+ * Requires `Transport`.
+ */
+export function SignerManagedAccount(accountIndex: number = 0) {
+  return Layer.effect(
+    Signer,
+    effect {
+      const transport = try Transport
+      let accounts: readonly Address[] = []
+      provide Transport = transport {
+        accounts = try getAccounts()
+      }
+      const address = accounts[accountIndex]
+      if (address === undefined) {
+        throw new InvalidConfigError({
+          field: "accountIndex",
+          value: accountIndex,
+          reason: `Managed account index ${accountIndex} out of range (available: ${accounts.length})`,
+        })
+      }
+      return {
+        address,
+        effect signMessage(data: Hex) {
+          provide Transport = transport {
+            return try signMessage(address, data)
+          }
+        },
+        effect signTransaction(tx: TransactionRequest) {
+          provide Transport = transport {
+            return try signTransaction({ ...tx, from: tx.from ?? address })
+          }
+        },
+        effect sendTransaction(tx: TransactionRequest) {
+          provide Transport = transport {
+            return try sendTransaction({ ...tx, from: tx.from ?? address })
+          }
+        },
+      }
+    },
+  )
+}
+
+/**
+ * Effect-scoped impersonating `Signer` Layer!
+ * Automatically calls `zevm_impersonateAccount(address)` when acquired and guarantees
+ * `zevm_stopImpersonatingAccount(address)` when the enclosing Layer/Scope finalizes.
+ */
+export function SignerImpersonated(address: Address) {
+  return Layer.effect(
+    Signer,
+    effect {
+      const transport = try Transport
+      try acquireRelease(
+        Effect.provideService(tevmImpersonateAccount(address), Transport, transport),
+        () => Effect.ignore(Effect.provideService(tevmStopImpersonatingAccount(address), Transport, transport)),
+      )
+      return {
+        address,
+        effect signMessage(_data: Hex) {
+          throw new TransportError({
+            transport: "signer",
+            method: "eth_sign",
+            message: `Impersonated account ${address} does not hold a private key for eth_sign`,
+          })
+        },
+        effect signTransaction(_tx: TransactionRequest) {
+          throw new TransportError({
+            transport: "signer",
+            method: "eth_signTransaction",
+            message: `Impersonated account ${address} cannot produce signed RLP; use sendTransaction`,
+          })
+        },
+        effect sendTransaction(tx: TransactionRequest) {
+          provide Transport = transport {
+            return try sendTransaction({ ...tx, from: address })
+          }
+        },
+      }
+    },
+  )
+}
+
+/** Convenience Effect action: read the active `Signer`'s address. */
+export effect function signerAddress(): Address!never!Signer {
+  return (try Signer).address
+}
+
+/** Convenience Effect action: send a transaction through the injected `Signer`. */
+export effect function sendSignedTransaction(tx: TransactionRequest): Hash32!TransportError!Signer {
+  const signer = try Signer
+  return try signer.sendTransaction(tx)
+}

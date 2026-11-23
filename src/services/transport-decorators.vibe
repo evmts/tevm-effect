@@ -1,0 +1,205 @@
+// Composable Effect Layer decorators for `Transport`:
+//   - `withTransportCache`: read-through cache for immutable RPC calls with auto-invalidation
+//   - `withTransportRateLimit`: Clock-based sliding-window rate limiter (TestClock-friendly)
+//   - `withTransportHooks`: structured onRequest / onResponse / onError telemetry hooks
+
+import { stringifyJson } from "../hex.vibe"
+import { Transport } from "./transport.vibe"
+import type { TransportError } from "../errors.vibe"
+
+const CACHEABLE_METHODS = new Set<string>([
+  "eth_chainId",
+  "net_version",
+  "web3_clientVersion",
+  "eth_getBlockByHash",
+  "eth_getTransactionByHash",
+  "eth_getTransactionReceipt",
+])
+
+function isMutatingMethod(method: string): boolean {
+  return (
+    method.startsWith("eth_send")
+    || method.startsWith("zevm_")
+    || method.startsWith("anvil_")
+    || method.startsWith("hardhat_")
+    || method.startsWith("evm_")
+    || method.startsWith("engine_forkchoice")
+    || method.startsWith("engine_newPayload")
+  )
+}
+
+export interface TransportCacheOptions {
+  /** Maximum cached entries before oldest entries are evicted. Defaults to 512. */
+  readonly maxEntries?: number
+  /** Additional method names eligible for caching. */
+  readonly extraMethods?: readonly string[]
+}
+
+/**
+ * Wrap any injected `Transport` with an Effect `Ref`-backed read-through cache.
+ * Caches immutable responses (skipping `null` receipts/txs) and automatically clears
+ * cache entries when mutating methods (`zevm_*`, `eth_send*`, etc.) execute.
+ */
+export function withTransportCache(options: TransportCacheOptions = {}) {
+  const maxEntries = options.maxEntries ?? 512
+  const allowed = new Set<string>(CACHEABLE_METHODS)
+  if (options.extraMethods !== undefined) {
+    for (const m of options.extraMethods) allowed.add(m)
+  }
+
+  return Layer.effect(
+    Transport,
+    effect {
+      const inner = try Transport
+      const cacheRef = try Ref.make(new Map<string, unknown>())
+
+      return {
+        effect request<T = unknown>(method: string, params: readonly unknown[] = []) {
+          if (isMutatingMethod(method)) {
+            const res = try inner.request<T>(method, params)
+            try Ref.set(cacheRef, new Map<string, unknown>())
+            return res
+          }
+
+          if (!allowed.has(method)) {
+            return try inner.request<T>(method, params)
+          }
+
+          const keyStr = (stringifyJson([method, params])) catch () => ""
+          if (keyStr.length > 0) {
+            const existing = (try Ref.get(cacheRef)).get(keyStr)
+            if (existing !== undefined) {
+              return existing as T
+            }
+          }
+
+          const value = try inner.request<T>(method, params)
+          if (keyStr.length > 0 && value !== null && value !== undefined) {
+            try Ref.update(cacheRef, (map) => {
+              const next = new Map(map)
+              if (next.size >= maxEntries) {
+                const firstKey = next.keys().next().value
+                if (firstKey !== undefined) next.delete(firstKey)
+              }
+              next.set(keyStr, value)
+              return next
+            })
+          }
+          return value
+        },
+        effect rpc(rawJson: string) {
+          const res = try inner.rpc(rawJson)
+          try Ref.set(cacheRef, new Map<string, unknown>())
+          return res
+        },
+      }
+    },
+  )
+}
+
+export interface TransportRateLimitOptions {
+  /** Maximum number of RPC requests permitted per sliding window. */
+  readonly maxRequests: number
+  /** Window duration (driven by Effect Clock). */
+  readonly window: Duration.Input
+}
+
+/**
+ * Wrap any injected `Transport` with an Effect `Clock`-driven sliding-window rate limiter.
+ * Suspends excess callers with `sleep` until capacity frees up — deterministic under `TestClock`!
+ */
+export function withTransportRateLimit(options: TransportRateLimitOptions) {
+  const windowMs = Duration.toMillis(Duration.fromInputUnsafe(options.window))
+  const limit = Math.max(1, Math.trunc(options.maxRequests))
+
+  return Layer.effect(
+    Transport,
+    effect {
+      const inner = try Transport
+      const lock = try Semaphore.make(1)
+      const timestampsRef = try Ref.make<readonly number[]>([])
+
+      effect function acquirePermit(): void!never {
+        while (true) {
+          const waitMs = try lock.withPermits(1)(
+            effect {
+              const now = try Clock.currentTimeMillis
+              const cutoff = now - windowMs
+              const active = (try Ref.get(timestampsRef)).filter((t) => t > cutoff)
+              if (active.length < limit) {
+                try Ref.set(timestampsRef, [...active, now])
+                return 0
+              }
+              const oldest = active[0] ?? now
+              try Ref.set(timestampsRef, active)
+              return Math.max(1, oldest + windowMs - now)
+            },
+          )
+          if (waitMs <= 0) return
+          try sleep(`${waitMs} millis`)
+        }
+      }
+
+      return {
+        effect request<T = unknown>(method: string, params?: readonly unknown[]) {
+          try acquirePermit()
+          return try inner.request<T>(method, params)
+        },
+        effect rpc(rawJson: string) {
+          try acquirePermit()
+          return try inner.rpc(rawJson)
+        },
+      }
+    },
+  )
+}
+
+export interface TransportHooks {
+  readonly onRequest?: (info: { readonly method: string; readonly params: readonly unknown[] }) => void!!
+  readonly onResponse?: (info: {
+    readonly method: string
+    readonly params: readonly unknown[]
+    readonly result: unknown
+    readonly durationMs: number
+  }) => void!!
+  readonly onError?: (info: {
+    readonly method: string
+    readonly params: readonly unknown[]
+    readonly error: TransportError
+    readonly durationMs: number
+  }) => void!!
+}
+
+/** Wrap any injected `Transport` with Effect observability hooks and request timing. */
+export function withTransportHooks(hooks: TransportHooks) {
+  return Layer.effect(
+    Transport,
+    effect {
+      const inner = try Transport
+      return {
+        effect request<T = unknown>(method: string, params: readonly unknown[] = []) {
+          if (hooks.onRequest !== undefined) {
+            try hooks.onRequest({ method, params })
+          }
+          const start = try Clock.currentTimeMillis
+          const outcome = try exit(inner.request<T>(method, params))
+          const durationMs = (try Clock.currentTimeMillis) - start
+          if (Exit.isSuccess(outcome)) {
+            if (hooks.onResponse !== undefined) {
+              try hooks.onResponse({ method, params, result: outcome.value, durationMs })
+            }
+            return outcome.value
+          }
+          const errOpt = Cause.findErrorOption(outcome.cause)
+          if (Option.isSome(errOpt) && hooks.onError !== undefined) {
+            try hooks.onError({ method, params, error: errOpt.value, durationMs })
+          }
+          return try Effect.failCause(outcome.cause)
+        },
+        effect rpc(rawJson: string) {
+          return try inner.rpc(rawJson)
+        },
+      }
+    },
+  )
+}

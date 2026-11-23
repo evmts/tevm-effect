@@ -1,0 +1,211 @@
+import { assert, describe, it } from "@effect/vitest"
+import {
+  AbiCodec,
+  AnvilCommon,
+  bindContract,
+  Signer,
+  TevmCoreLive,
+  tevmSetAccount,
+  TransportError,
+} from "../index.vibe"
+import { ZevmBackendMemory } from "../testing/index.vibe"
+import {
+  decodeRevertReason,
+  formatRevertReason,
+  SignerLocalVoltaire,
+  toEip1193Provider,
+  toVoltaireTransport,
+  VoltaireAbiCodecLive,
+} from "./index.vibe"
+
+const VoltaireTevm = Layer.merge(
+  Layer.provideMerge(TevmCoreLive, Layer.merge(AnvilCommon, ZevmBackendMemory)),
+  VoltaireAbiCodecLive,
+)
+
+const ERC20_ABI = [
+  {
+    type: "constructor",
+    inputs: [
+      { name: "name_", type: "string" },
+      { name: "supply_", type: "uint256" },
+    ],
+  },
+  {
+    type: "function",
+    name: "greet",
+    inputs: [{ name: "who", type: "string" }],
+    outputs: [{ name: "", type: "string" }],
+  },
+  {
+    type: "function",
+    name: "balanceOf",
+    inputs: [{ name: "account", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+  {
+    type: "event",
+    name: "Transfer",
+    inputs: [
+      { name: "from", type: "address", indexed: true },
+      { name: "to", type: "address", indexed: true },
+      { name: "value", type: "uint256", indexed: false },
+    ],
+  },
+  {
+    type: "error",
+    name: "InsufficientBalance",
+    inputs: [
+      { name: "available", type: "uint256" },
+      { name: "required", type: "uint256" },
+    ],
+  },
+] as const
+
+describe("@tevm/voltaire & voltaire-effect v2 integration", () => {
+  it.effect("encodes & decodes dynamic Solidity ABI types, events, and Keccak-256 locally", effect () => {
+    provide VoltaireAbiCodecLive {
+      const codec = try AbiCodec
+
+      // Keccak-256 of empty bytes
+      const hash = try codec.keccak256("0x")
+      try Effect.try(() =>
+        assert.strictEqual(
+          hash,
+          "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+        )
+      )
+
+      // Dynamic string function calldata encoding
+      const calldata = try codec.encodeFunctionData(ERC20_ABI, "greet", ["tevm-effect"])
+      try Effect.try(() => assert.strictEqual(calldata.startsWith("0x"), true))
+      try Effect.try(() => assert.strictEqual(calldata.length > 10, true))
+
+      // Decode dynamic string return data
+      // ABI-encoded "hello": offset 0x20, length 5, "hello" padded
+      const encodedHello =
+        "0x0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000568656c6c6f000000000000000000000000000000000000000000000000000000" as const
+      const greeting = try codec.decodeFunctionResult(ERC20_ABI, "greet", encodedHello)
+      try Effect.try(() => assert.strictEqual(greeting, "hello"))
+
+      // Constructor encoding with dynamic string + uint256
+      const deployData = try codec.encodeDeployData(ERC20_ABI, "0x60806040", ["MyToken", 1000n])
+      try Effect.try(() => assert.strictEqual(deployData.startsWith("0x60806040"), true))
+      try Effect.try(() => assert.strictEqual(deployData.length > 10, true))
+
+      // Decode ERC-20 Transfer event log
+      // keccak256("Transfer(address,address,uint256)")
+      const transferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef" as const
+      const fromTopic = "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266" as const
+      const toTopic = "0x00000000000000000000000070997970c51812dc3a010c7d01b50e0d17dc79c8" as const
+      const amountData = "0x00000000000000000000000000000000000000000000000000000000000003e8" as const
+
+      const decodedLog = try codec.decodeEventLog(ERC20_ABI, {
+        removed: false,
+        logIndex: "0x0",
+        transactionIndex: "0x0",
+        transactionHash: transferTopic,
+        blockHash: transferTopic,
+        blockNumber: "0x1",
+        address: "0x0000000000000000000000000000000000000001",
+        data: amountData,
+        topics: [transferTopic, fromTopic, toTopic],
+      })
+      try Effect.try(() => assert.strictEqual(decodedLog.eventName, "Transfer"))
+      try Effect.try(() => assert.strictEqual(decodedLog.args["value"], 1000n))
+    }
+  })
+
+  it.effect("decodes Error(string), Panic(uint256), custom ABI errors, and raw revert bytes", effect () => {
+    // Error("Not owner")
+    const errStringData = "0x08c379a0"
+      + "0000000000000000000000000000000000000000000000000000000000000020"
+      + "0000000000000000000000000000000000000000000000000000000000000009"
+      + "4e6f74206f776e65720000000000000000000000000000000000000000000000"
+    const r1 = try decodeRevertReason(errStringData)
+    try Effect.try(() => assert.strictEqual(r1._tag, "ErrorString"))
+    try Effect.try(() => assert.strictEqual(formatRevertReason(r1), "Reverted: Not owner"))
+
+    // Panic(0x11) -> Arithmetic overflow or underflow
+    const panicData = "0x4e487b710000000000000000000000000000000000000000000000000000000000000011"
+    const r2 = try decodeRevertReason(panicData)
+    try Effect.try(() => assert.strictEqual(r2._tag, "Panic"))
+    try Effect.try(() => assert.strictEqual(formatRevertReason(r2).includes("Arithmetic overflow"), true))
+
+    // Custom error InsufficientBalance(50, 100)
+    // selector = keccak256("InsufficientBalance(uint256,uint256)")[0..4] = 0xcf479181
+    const customData = "0xcf479181"
+      + "0000000000000000000000000000000000000000000000000000000000000032"
+      + "0000000000000000000000000000000000000000000000000000000000000064"
+    const r3 = try decodeRevertReason(customData, ERC20_ABI)
+    try Effect.try(() => assert.strictEqual(r3._tag, "Custom"))
+    if (r3._tag === "Custom") {
+      try Effect.try(() => assert.strictEqual(r3.name, "InsufficientBalance"))
+      try Effect.try(() => assert.deepStrictEqual(r3.args, [50n, 100n]))
+    }
+
+    const r4 = try decodeRevertReason("0x")
+    try Effect.try(() => assert.strictEqual(r4._tag, "Raw"))
+  })
+
+  it.effect("bridges Transport to voltaire-effect v2 (single + batch) and EIP-1193", effect () => {
+    provide VoltaireTevm {
+      const vt = try toVoltaireTransport()
+      const chainId = try vt.request<string>("eth_chainId")
+      try Effect.try(() => assert.strictEqual(chainId, "0x7a69"))
+
+      const batch = try vt.requestBatch([
+        { method: "eth_chainId" },
+        { method: "eth_blockNumber" },
+        { method: "unknown_method" },
+      ])
+      try Effect.try(() => assert.strictEqual(batch.length, 3))
+      try Effect.try(() => assert.strictEqual(batch[0]?._tag, "Ok"))
+      try Effect.try(() => assert.strictEqual(batch[1]?._tag, "Ok"))
+      try Effect.try(() => assert.strictEqual(batch[2]?._tag, "Err"))
+
+      // EIP-1193 provider interop
+      const provider = try toEip1193Provider()
+      const eipChainId = try tryPromise({
+        try: () => provider.request({ method: "eth_chainId" }),
+        catch: (cause) =>
+          new TransportError({
+            transport: "eip1193",
+            method: "eth_chainId",
+            message: String(cause),
+            cause,
+          }),
+      })
+      try Effect.try(() => assert.strictEqual(eipChainId, "0x7a69"))
+
+      // Bound contract powered by VoltaireAbiCodecLive
+      const tokenAddr = "0x0000000000000000000000000000000000007001" as const
+      try tevmSetAccount({
+        address: tokenAddr,
+        code: "0x000000000000000000000000000000000000000000000000000000000000007b",
+      })
+      const token = bindContract({ address: tokenAddr, abi: ERC20_ABI })
+      const bal = try token.read<bigint>("balanceOf", [tokenAddr])
+      try Effect.try(() => assert.strictEqual(bal, 123n))
+    }
+  })
+
+  it.effect("derives address and produces real 65-byte Secp256k1 EIP-191 signature with SignerLocalVoltaire", effect () => {
+    // Standard Anvil/Hardhat dev account #0 private key (public test vector)
+    const testKey = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" as const
+    const LocalSignerLayer = Layer.provide(SignerLocalVoltaire(testKey), VoltaireTevm)
+
+    provide LocalSignerLayer {
+      const signer = try Signer
+      try Effect.try(() =>
+        assert.strictEqual(
+          signer.address.toLowerCase(),
+          "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+        )
+      )
+      const sig = try signer.signMessage("0x68656c6c6f")
+      // 0x + 130 hex chars (65 bytes: r[32] + s[32] + v[1])
+      try Effect.try(() => assert.strictEqual(sig.length, 132))
+    }
+  })
+})

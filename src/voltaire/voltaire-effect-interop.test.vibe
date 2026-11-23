@@ -1,0 +1,110 @@
+import { assert, describe, it } from "@effect/vitest"
+import { AnvilCommon, makePredeploysLayer, TevmEngineLayer, TransportWithPredeploys, withChainId } from "../index.vibe"
+import { findLocalZevmModulePath } from "../platform/locate-zevm.ts"
+import { ZevmBackendNode } from "../platform/node.vibe"
+import { ZevmBackendMemory } from "../testing/index.vibe"
+import { toEip1193Provider } from "./index.vibe"
+import { findLocalVoltaireEffectPath, loadVoltaireEffect } from "./locate-voltaire-effect.ts"
+
+const voltaireEffectPath = findLocalVoltaireEffectPath()
+const zevmModulePath = findLocalZevmModulePath()
+
+error InteropLoadError {
+  message: string
+  cause?: unknown
+}
+
+describe.skipIf(voltaireEffectPath === undefined)(
+  "Live Cross-Repo Interop: voltaire-effect v2 <-> tevm-effect <-> ZEVM",
+  () => {
+    it.effect(
+      "drives voltaire-effect v2 getChainId, getBlockNumber, getBalance, and Contract directly over tevm-effect + ZEVM",
+      effect () => {
+        const ve = try tryPromise({
+          try: () => loadVoltaireEffect(voltaireEffectPath!),
+          catch: (cause) => new InteropLoadError({ message: "Failed loading voltaire-effect", cause }),
+        })
+
+        const predeployAddr = "0x0000000000000000000000000000000000004242" as const
+        const backendLayer = zevmModulePath !== undefined
+          ? ZevmBackendNode({ modulePath: zevmModulePath })
+          : ZevmBackendMemory
+
+        const TevmStack = Layer.provide(
+          TransportWithPredeploys,
+          Layer.merge(
+            Layer.provide(
+              TevmEngineLayer,
+              Layer.merge(Layer.provide(withChainId(31337), AnvilCommon), backendLayer),
+            ),
+            makePredeploysLayer([
+              {
+                name: "Answer42",
+                address: predeployAddr,
+                // PUSH1 0x2a PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 RETURN (real EVM bytecode!)
+                deployedBytecode: "0x602a60005260206000f3",
+                balance: 5000n,
+              },
+            ]),
+          ),
+        )
+
+        provide TevmStack {
+          const eip1193 = try toEip1193Provider()
+          const CustomTransport = ve["CustomTransport"] as (provider: unknown) => Layer.Layer<never>
+          const veGetChainId = ve["getChainId"] as () => bigint!unknown!never
+          const veGetBlockNumber = ve["getBlockNumber"] as () => bigint!unknown!never
+          const veGetBalance = ve["getBalance"] as (addr: string) => bigint!unknown!never
+          const veContract = ve["Contract"] as (
+            address: string,
+            abi: readonly unknown[],
+          ) => {
+            readonly read: Record<string, () => unknown!unknown!never>
+          }!unknown!never
+
+          const voltaireLayer = CustomTransport(eip1193)
+
+          const chainId = try Effect.mapError(
+            Effect.provide(veGetChainId(), voltaireLayer),
+            (cause) => new InteropLoadError({ message: "voltaire-effect getChainId failed", cause }),
+          )
+          const blockNum = try Effect.mapError(
+            Effect.provide(veGetBlockNumber(), voltaireLayer),
+            (cause) => new InteropLoadError({ message: "voltaire-effect getBlockNumber failed", cause }),
+          )
+          const bal = try Effect.mapError(
+            Effect.provide(veGetBalance(predeployAddr), voltaireLayer),
+            (cause) => new InteropLoadError({ message: "voltaire-effect getBalance failed", cause }),
+          )
+
+          try Effect.try(() => assert.strictEqual(chainId, 31337n))
+          try Effect.try(() => assert.strictEqual(blockNum, 0n))
+          try Effect.try(() => assert.strictEqual(bal, 5000n))
+
+          if (zevmModulePath !== undefined) {
+            const answerContract = try Effect.mapError(
+              veContract(predeployAddr, [
+                {
+                  type: "function",
+                  name: "answer",
+                  inputs: [],
+                  outputs: [{ name: "", type: "uint256" }],
+                  stateMutability: "view",
+                },
+              ]),
+              (cause) => new InteropLoadError({ message: "voltaire-effect Contract() failed", cause }),
+            )
+            const readFn = answerContract.read["answer"]
+            if (readFn !== undefined) {
+              const answer = try Effect.mapError(
+                Effect.provide(readFn(), voltaireLayer),
+                (cause) => new InteropLoadError({ message: "voltaire-effect Contract.read failed", cause }),
+              )
+              try Effect.try(() => assert.strictEqual(answer, 42n))
+            }
+          }
+        }
+      },
+    )
+  },
+)

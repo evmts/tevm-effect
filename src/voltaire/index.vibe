@@ -1,17 +1,186 @@
-// Voltaire integration boundary for voltaire-effect v2.
-// Defines structural adapter interfaces so tevm-effect plugs straight into
-// voltaire-effect's AbiEncoder, Keccak256, and TransportService Layers with
-// zero changes to tevm-effect actions, streams, or services.
+// First-class Voltaire & voltaire-effect v2 integration for tevm-effect.
+//
+// Provides:
+//   - `VoltaireAbiCodecLive`: full dynamic Solidity ABI + Keccak-256 `AbiCodec` Layer
+//     powered directly by `@tevm/voltaire` (zero RPC roundtrips!)
+//   - `VoltaireAbiCodec(adapter)`: custom adapter for `voltaire-effect` v2 services
+//   - `RevertReason` + `decodeRevertReason` + `formatRevertReason` (matching voltaire-effect v2)
+//   - `toVoltaireTransport()`: exact `voltaire-effect` v2 `Transport` shape (`request` + `requestBatch`)
+//   - `toEip1193Provider()`: standard EIP-1193 provider bridge for `CustomTransport` / viem / wagmi
+//   - `SignerLocalVoltaire(privateKey)`: local Secp256k1 `Signer` Layer
 
-import { CodecError, TransportError } from "../errors.vibe"
+import { sendTransaction } from "../actions/eth.vibe"
+import { CodecError, InvalidConfigError, TransportError } from "../errors.vibe"
+import { parseJson, stringifyJson } from "../hex.vibe"
 import { AbiCodec } from "../services/codec.vibe"
+import { Signer } from "../services/signer.vibe"
 import { Transport } from "../services/transport.vibe"
-import type { Abi, DecodedEventLog, Hash32, Hex, LogObject } from "../types.vibe"
+import type {
+  Abi,
+  DecodedEventLog,
+  Hash32,
+  Hex,
+  JsonRpcEnvelope,
+  LogObject,
+  RpcCall,
+  TransactionRequest,
+} from "../types.vibe"
+import {
+  voltaireAddressFromPrivateKey,
+  voltaireDecodeCustomError,
+  voltaireDecodeEventLog,
+  voltaireDecodeFunctionResult,
+  voltaireDecodeParameters,
+  voltaireEncodeDeployData,
+  voltaireEncodeFunctionData,
+  voltaireKeccak256,
+  voltaireSignPersonalMessage,
+} from "./native-voltaire.ts"
+
+// ── Revert Reason Decoding (mirrors voltaire-effect v2) ──────────────────────
+
+export data RevertReason {
+  ErrorString { reason: string }
+  Panic { code: bigint; description: string }
+  Custom { name: string; signature: string; args: readonly unknown[] }
+  Raw { data: string }
+}
+
+const PANIC_DESCRIPTIONS: Record<string, string> = {
+  "0": "Generic compiler panic",
+  "1": "Assert failed",
+  "17": "Arithmetic overflow or underflow",
+  "18": "Division or modulo by zero",
+  "33": "Conversion to invalid enum value",
+  "34": "Incorrectly encoded storage byte array",
+  "49": "Pop on empty array",
+  "50": "Array index out of bounds",
+  "65": "Out of memory",
+  "81": "Called zero-initialized function pointer",
+}
+
+/** Decode Solidity `Error(string)`, `Panic(uint256)`, ABI custom errors, or raw revert bytes. */
+export effect function decodeRevertReason(data: string, abi?: Abi): RevertReason!! {
+  const normalized = data.toLowerCase()
+  if (!normalized.startsWith("0x") || normalized.length < 10) {
+    return RevertReason.Raw({ data })
+  }
+  const selector = normalized.slice(0, 10)
+  const payload = `0x${normalized.slice(10)}` as Hex
+
+  if (selector === "0x08c379a0") {
+    const decoded = Effect.try(() => voltaireDecodeParameters([{ type: "string" }], payload)) catch () => undefined
+    if (decoded !== undefined && typeof decoded[0] === "string") {
+      return RevertReason.ErrorString({ reason: decoded[0] })
+    }
+  }
+
+  if (selector === "0x4e487b71") {
+    const decoded = Effect.try(() => voltaireDecodeParameters([{ type: "uint256" }], payload)) catch () => undefined
+    if (decoded !== undefined && typeof decoded[0] === "bigint") {
+      const code = decoded[0]
+      const description = PANIC_DESCRIPTIONS[code.toString()] ?? `Unknown panic code 0x${code.toString(16)}`
+      return RevertReason.Panic({ code, description })
+    }
+  }
+
+  if (abi !== undefined) {
+    const custom = Effect.try(() => voltaireDecodeCustomError(abi, normalized as Hex)) catch () => undefined
+    if (custom !== undefined) {
+      return RevertReason.Custom({
+        name: custom.name,
+        signature: custom.signature,
+        args: custom.args,
+      })
+    }
+  }
+
+  return RevertReason.Raw({ data })
+}
+
+export function formatRevertReason(reason: RevertReason): string {
+  return match (reason) {
+    when { _tag: "ErrorString", reason: let msg }: `Reverted: ${msg}`;
+    when { _tag: "Panic", let code, let description }: `Panic(0x${code.toString(16)}): ${description}`;
+    when { _tag: "Custom", let name, let args }: args.length > 0
+      ? `Custom error ${name}(${args.map((a) => String(a)).join(", ")})`
+      : `Custom error ${name}()`;
+    when { _tag: "Raw", let data }: data === "0x" ? "Execution reverted without reason" : `Reverted with data ${data}`;
+  }
+}
+
+// ── Live @tevm/voltaire AbiCodec Layer ───────────────────────────────────────
 
 /**
- * Structural adapter shape matching voltaire-effect's ABI + Keccak256 primitives/services.
- * Pass voltaire-effect v2's services directly into `VoltaireAbiCodec(adapter)`.
+ * Full-featured `AbiCodec` Layer powered directly by `@tevm/voltaire`.
+ * Supports all dynamic Solidity ABI types (`string`, `bytes`, tuples, structs,
+ * dynamic arrays, constructors, events) and local Keccak-256 with zero RPC overhead.
  */
+export const VoltaireAbiCodecLive = Layer.succeed(AbiCodec, {
+  effect encodeFunctionData(abi: Abi, functionName: string, args: readonly unknown[] = []) {
+    return try Effect.try({
+      try: () => voltaireEncodeFunctionData(abi, functionName, args),
+      catch: (cause) =>
+        new CodecError({
+          operation: "voltaire.encodeFunctionData",
+          message: cause instanceof Error ? cause.message : String(cause),
+          cause,
+        }),
+    })
+  },
+  effect decodeFunctionResult(abi: Abi, functionName: string, data: Hex) {
+    return try Effect.try({
+      try: () => voltaireDecodeFunctionResult(abi, functionName, data),
+      catch: (cause) =>
+        new CodecError({
+          operation: "voltaire.decodeFunctionResult",
+          message: cause instanceof Error ? cause.message : String(cause),
+          cause,
+        }),
+    })
+  },
+  effect encodeDeployData(abi: Abi, bytecode: Hex, args: readonly unknown[] = []) {
+    return try Effect.try({
+      try: () => voltaireEncodeDeployData(abi, bytecode, args),
+      catch: (cause) =>
+        new CodecError({
+          operation: "voltaire.encodeDeployData",
+          message: cause instanceof Error ? cause.message : String(cause),
+          cause,
+        }),
+    })
+  },
+  effect decodeEventLog(abi: Abi, log: LogObject) {
+    const decoded = try Effect.try({
+      try: () => voltaireDecodeEventLog(abi, log),
+      catch: (cause) =>
+        new CodecError({
+          operation: "voltaire.decodeEventLog",
+          message: cause instanceof Error ? cause.message : String(cause),
+          cause,
+        }),
+    })
+    return {
+      eventName: decoded.eventName,
+      args: decoded.args,
+      raw: log,
+    }
+  },
+  effect keccak256(data: Hex) {
+    return try Effect.try({
+      try: () => voltaireKeccak256(data),
+      catch: (cause) =>
+        new CodecError({
+          operation: "voltaire.keccak256",
+          message: cause instanceof Error ? cause.message : String(cause),
+          cause,
+        }),
+    })
+  },
+})
+
+// ── Custom voltaire-effect v2 Adapter ────────────────────────────────────────
+
 export interface VoltaireCodecAdapter {
   readonly encodeFunctionData: (abi: Abi, functionName: string, args?: readonly unknown[]) => Hex!unknown
   readonly decodeFunctionResult: (abi: Abi, functionName: string, data: Hex) => unknown!unknown
@@ -20,10 +189,6 @@ export interface VoltaireCodecAdapter {
   readonly keccak256: (data: Hex) => Hash32!unknown
 }
 
-/**
- * Build an `AbiCodec` Layer from a `voltaire-effect` adapter.
- * Maps any Voltaire codec error into tevm-effect's typed `CodecError`.
- */
 export function VoltaireAbiCodec(adapter: VoltaireCodecAdapter) {
   return Layer.succeed(AbiCodec, {
     effect encodeFunctionData(abi: Abi, functionName: string, args?: readonly unknown[]) {
@@ -84,21 +249,156 @@ export function VoltaireAbiCodec(adapter: VoltaireCodecAdapter) {
   })
 }
 
-/**
- * Structural shape matching voltaire-effect's `TransportService` (`request(method, params?)`).
- * Allows any `tevm-effect` `Transport` (including in-process `Evm`) to power
- * `voltaire-effect`'s `Provider`, `Signer`, `Contract`, and `BlockStream` services!
- */
-export interface VoltaireTransportShape {
-  readonly request: <T>(method: string, params?: unknown[]) => T!TransportError
+// ── voltaire-effect v2 Transport & EIP-1193 Bridges ──────────────────────────
+
+export data VoltaireBatchItemResult {
+  Ok { value: unknown }
+  Err { error: TransportError }
 }
 
-/** Extract a voltaire-effect-compatible transport shape from tevm-effect's injected `Transport`. */
+/**
+ * Exact structural match for `voltaire-effect` v2's `Transport` service
+ * (`request` + `requestBatch`).
+ */
+export interface VoltaireTransportShape {
+  readonly request: <T = unknown>(method: string, params?: readonly unknown[]) => T!TransportError
+  readonly requestBatch: (
+    requests: readonly RpcCall[],
+  ) => (readonly VoltaireBatchItemResult[])!TransportError
+}
+
+/**
+ * Bridge tevm-effect's injected `Transport` (including in-process native ZEVM)
+ * directly to `voltaire-effect` v2's `Transport` contract (`request` + `requestBatch`).
+ */
 export effect function toVoltaireTransport(): VoltaireTransportShape!never!Transport {
   const transport = try Transport
   return {
-    effect request<T>(method: string, params?: unknown[]) {
+    effect request<T = unknown>(method: string, params?: readonly unknown[]) {
       return try transport.request<T>(method, params)
     },
+    effect requestBatch(requests: readonly RpcCall[]) {
+      if (requests.length === 0) return []
+      const payload = requests.map((req, idx) => ({
+        jsonrpc: "2.0" as const,
+        id: idx + 1,
+        method: req.method,
+        params: req.params ?? [],
+      }))
+      const serialized = (stringifyJson(payload)) catch effect (e) => {
+        throw new TransportError({
+          transport: "voltaire-bridge",
+          message: e.message,
+          cause: e,
+        })
+      }
+      const raw = try transport.rpc(serialized)
+      if (raw === null) return []
+      const parsed = (parseJson(raw)) catch effect (e) => {
+        throw new TransportError({
+          transport: "voltaire-bridge",
+          code: -32700,
+          message: e.message,
+          cause: e,
+        })
+      }
+      if (!Array.isArray(parsed)) {
+        throw new TransportError({
+          transport: "voltaire-bridge",
+          message: "Expected JSON-RPC batch array response",
+        })
+      }
+      const results: VoltaireBatchItemResult[] = []
+      for (let i = 0; i < parsed.length; i++) {
+        const item = parsed[i] as JsonRpcEnvelope<unknown>
+        const method = requests[i]?.method ?? "batch"
+        if ("error" in item) {
+          results.push(
+            VoltaireBatchItemResult.Err({
+              error: new TransportError({
+                transport: "voltaire-bridge",
+                method,
+                code: item.error.code,
+                message: item.error.message,
+                data: item.error.data,
+              }),
+            }),
+          )
+        } else {
+          results.push(VoltaireBatchItemResult.Ok({ value: item.result }))
+        }
+      }
+      return results
+    },
   }
+}
+
+export interface Eip1193Provider {
+  readonly request: (args: {
+    readonly method: string
+    readonly params?: readonly unknown[]
+  }) => Promise<unknown>
+}
+
+/**
+ * Create a standard EIP-1193 provider backed by the injected `Transport`.
+ * Plug directly into `voltaire-effect`'s `CustomTransport(provider)`, viem, or wagmi!
+ */
+export effect function toEip1193Provider(): Eip1193Provider!never!Transport {
+  const transport = try Transport
+  return {
+    request(args) {
+      return runPromise(transport.request<unknown>(args.method, args.params))
+    },
+  }
+}
+
+// ── Local Voltaire Secp256k1 Signer Layer ────────────────────────────────────
+
+/**
+ * Local private-key `Signer` Layer powered by `@tevm/voltaire` (`Address` + `Secp256k1` + `Keccak256`).
+ * Signs EIP-191 personal messages locally and sends transactions over the injected `Transport`.
+ */
+export function SignerLocalVoltaire(privateKeyHex: Hex) {
+  return Layer.effect(
+    Signer,
+    effect {
+      const transport = try Transport
+      const address = try Effect.try({
+        try: () => voltaireAddressFromPrivateKey(privateKeyHex),
+        catch: (cause) =>
+          new InvalidConfigError({
+            field: "privateKeyHex",
+            value: "[redacted]",
+            reason: cause instanceof Error ? cause.message : "Invalid private key",
+          }),
+      })
+
+      return {
+        address,
+        effect signMessage(data: Hex) {
+          return try Effect.try({
+            try: () => voltaireSignPersonalMessage(privateKeyHex, data),
+            catch: (cause) =>
+              new TransportError({
+                transport: "voltaire-local-signer",
+                method: "eth_sign",
+                message: cause instanceof Error ? cause.message : "Local Secp256k1 signing failed",
+                cause,
+              }),
+          })
+        },
+        effect signTransaction(tx: TransactionRequest) {
+          provide Transport = transport {
+            return try transport.request<Hex>("eth_signTransaction", [{ ...tx, from: address }])
+          }
+        },
+        effect sendTransaction(tx: TransactionRequest) {
+          provide Transport = transport {
+            return try sendTransaction({ ...tx, from: address })
+          }
+        },
+      }
+    },
+  )
 }

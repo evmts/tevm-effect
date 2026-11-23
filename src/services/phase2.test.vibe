@@ -1,0 +1,291 @@
+import { assert, describe, it } from "@effect/vitest"
+import { TestClock } from "effect/testing"
+import {
+  AnvilCommon,
+  BlockPollInterval,
+  engineExchangeCapabilities,
+  engineForkchoiceUpdated,
+  getChainId,
+  getCode,
+  getStorageAt,
+  makePredeploysLayer,
+  NonceManager,
+  NonceManagerLive,
+  RpcTimeout,
+  RpcTracing,
+  sendSignedTransaction,
+  sendTransaction,
+  SignerImpersonated,
+  SignerManagedAccount,
+  signerAddress,
+  SubscriptionManager,
+  SubscriptionManagerLive,
+  testTransport,
+  tevmMine,
+  tevmSetBalance,
+  tevmSetChainId,
+  TevmCoreLive,
+  TevmEngineLayer,
+  TransportWithPredeploys,
+  withBlockPollInterval,
+  withPredeploy,
+  withRpcTimeout,
+  withRpcTracing,
+  withTransportCache,
+  withTransportHooks,
+  withTransportRateLimit,
+} from "../index.vibe"
+import { DEFAULT_DEV_ACCOUNTS, ZevmBackendMemory } from "../testing/index.vibe"
+
+const MemoryTevm = Layer.provideMerge(
+  TevmCoreLive,
+  Layer.merge(AnvilCommon, ZevmBackendMemory),
+)
+
+describe("Effect 4 Context.Reference ambient config services", () => {
+  it.effect("uses default values and supports scoped Layer overrides", effect () => {
+    const defaultTimeout = try RpcTimeout
+    const defaultTracing = try RpcTracing
+    const defaultPoll = try BlockPollInterval
+    try Effect.try(() => assert.strictEqual(defaultTimeout, "30 seconds"))
+    try Effect.try(() => assert.strictEqual(defaultTracing, true))
+    try Effect.try(() => assert.strictEqual(defaultPoll, "50 millis"))
+
+    const CustomConfig = Layer.mergeAll(
+      withRpcTimeout("5 seconds"),
+      withRpcTracing(false),
+      withBlockPollInterval("10 millis"),
+    )
+    provide CustomConfig {
+      const t = try RpcTimeout
+      const tr = try RpcTracing
+      const p = try BlockPollInterval
+      try Effect.try(() => assert.strictEqual(t, "5 seconds"))
+      try Effect.try(() => assert.strictEqual(tr, false))
+      try Effect.try(() => assert.strictEqual(p, "10 millis"))
+    }
+  })
+})
+
+describe("Signer & NonceManager DI services", () => {
+  it.effect("binds SignerManagedAccount and scoped SignerImpersonated cleanly", effect () => {
+    const ManagedStack = Layer.provideMerge(SignerManagedAccount(0), MemoryTevm)
+    provide ManagedStack {
+      const addr = try signerAddress()
+      try Effect.try(() => assert.strictEqual(addr, DEFAULT_DEV_ACCOUNTS[0]))
+      const hash = try sendSignedTransaction({ to: DEFAULT_DEV_ACCOUNTS[1], value: 10n })
+      try Effect.try(() => assert.strictEqual(hash.startsWith("0x"), true))
+    }
+
+    const whale = "0x0000000000000000000000000000000000008888" as const
+    provide MemoryTevm {
+      try tevmSetBalance(whale, 10_000n)
+      // Inside SignerImpersonated scope, whale can send freely
+      provide SignerImpersonated(whale) {
+        const hash = try sendSignedTransaction({ to: DEFAULT_DEV_ACCOUNTS[1], value: 100n })
+        try Effect.try(() => assert.strictEqual(hash.startsWith("0x"), true))
+      }
+      // After scope exits, impersonation is automatically revoked!
+      const afterTag = sendTransaction({ from: whale, to: DEFAULT_DEV_ACCOUNTS[1], value: 1n }) catch (e) => e._tag
+      try Effect.try(() => assert.strictEqual(afterTag, "TransportError"))
+    }
+  })
+
+  it.effect("hands out strictly monotonic nonces across concurrent fibers via NonceManagerLive", effect () => {
+    const NonceStack = Layer.provideMerge(NonceManagerLive, MemoryTevm)
+    provide NonceStack {
+      const nm = try NonceManager
+      const addr = DEFAULT_DEV_ACCOUNTS[0]
+      const nonces = try.all [
+        nm.consume(addr),
+        nm.consume(addr),
+        nm.consume(addr),
+        nm.consume(addr),
+        nm.consume(addr),
+      ]
+      const sorted = [...nonces].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+      try Effect.try(() => assert.deepStrictEqual(sorted, [0n, 1n, 2n, 3n, 4n]))
+      const next = try nm.peek(addr)
+      try Effect.try(() => assert.strictEqual(next, 5n))
+
+      try nm.reset(addr)
+      const resynced = try nm.peek(addr)
+      try Effect.try(() => assert.strictEqual(resynced, 0n))
+    }
+  })
+})
+
+describe("Declarative Predeploys Layer", () => {
+  it.effect("automatically installs Layer-injected predeploys into ZEVM on startup", effect () => {
+    const contractA = "0x000000000000000000000000000000000000aaaa" as const
+    const contractB = "0x000000000000000000000000000000000000bbbb" as const
+    const slot0 = "0x0000000000000000000000000000000000000000000000000000000000000000" as const
+    const slotVal = "0x0000000000000000000000000000000000000000000000000000000000000009" as const
+
+    const PredeployLayers = Layer.provide(
+      withPredeploy({
+        name: "ContractB",
+        address: contractB,
+        deployedBytecode: "0x600160005260206000f3",
+      }),
+      makePredeploysLayer([
+        {
+          name: "ContractA",
+          address: contractA,
+          deployedBytecode: "0x602a60005260206000f3",
+          storage: { [slot0]: slotVal },
+        },
+      ]),
+    )
+
+    const Stack = Layer.provide(
+      TransportWithPredeploys,
+      Layer.merge(
+        Layer.provide(TevmEngineLayer, Layer.merge(AnvilCommon, ZevmBackendMemory)),
+        PredeployLayers,
+      ),
+    )
+
+    provide Stack {
+      const codeA = try getCode(contractA)
+      const codeB = try getCode(contractB)
+      const stored = try getStorageAt(contractA, slot0)
+      try Effect.try(() => assert.strictEqual(codeA, "0x602a60005260206000f3"))
+      try Effect.try(() => assert.strictEqual(codeB, "0x600160005260206000f3"))
+      try Effect.try(() => assert.strictEqual(stored, slotVal))
+    }
+  })
+})
+
+describe("Transport Decorators (Cache, RateLimit, Hooks)", () => {
+  it.effect("caches immutable reads and invalidates automatically on mutations", effect () => {
+    let calls = 0
+    let chainHex = "0x7a69"
+    const counting = testTransport(effect (method, params) => {
+      calls++
+      if (method === "eth_chainId") return chainHex
+      if (method === "zevm_setChainId") {
+        chainHex = String(params[0] ?? "0x1")
+        return true
+      }
+      return null
+    })
+    const cached = Layer.provide(withTransportCache(), counting)
+
+    provide cached {
+      const c1 = try getChainId()
+      const c2 = try getChainId()
+      try Effect.try(() => assert.strictEqual(c1, 31337n))
+      try Effect.try(() => assert.strictEqual(c2, 31337n))
+      // Second call was served from cache -> still only 1 underlying call!
+      try Effect.try(() => assert.strictEqual(calls, 1))
+
+      // Mutating call invalidates cache
+      try tevmSetChainId(10)
+      const c3 = try getChainId()
+      try Effect.try(() => assert.strictEqual(c3, 10n))
+      try Effect.try(() => assert.strictEqual(calls, 3))
+    }
+  })
+
+  it.effect("rate-limits excess requests deterministically with TestClock", effect () => {
+    let executed = 0
+    const mock = testTransport(effect () => {
+      executed++
+      return "0x1"
+    })
+    const limited = Layer.provide(
+      withTransportRateLimit({ maxRequests: 2, window: "100 millis" }),
+      mock,
+    )
+
+    provide limited {
+      try getChainId()
+      try getChainId()
+      try Effect.try(() => assert.strictEqual(executed, 2))
+
+      // 3rd request inside the 100ms window waits until TestClock advances
+      const third = fork getChainId()
+      try Effect.yieldNow
+      try Effect.try(() => assert.strictEqual(executed, 2))
+
+      try TestClock.adjust("150 millis")
+      const res = try join third
+      try Effect.try(() => assert.strictEqual(res, 1n))
+      try Effect.try(() => assert.strictEqual(executed, 3))
+    }
+  })
+
+  it.effect("invokes onRequest and onResponse telemetry hooks", effect () => {
+    const seen: string[] = []
+    const hooked = Layer.provide(
+      withTransportHooks({
+        effect onRequest(info) {
+          seen.push(`req:${info.method}`)
+        },
+        effect onResponse(info) {
+          seen.push(`res:${info.method}`)
+        },
+      }),
+      MemoryTevm,
+    )
+
+    provide hooked {
+      try getChainId()
+      try Effect.try(() => assert.deepStrictEqual(seen, ["req:eth_chainId", "res:eth_chainId"]))
+    }
+  })
+})
+
+describe("SubscriptionManager & Engine API", () => {
+  it.effect("multiplexes live newHeads notifications and cleans up on unsubscribe", effect () => {
+    const SubStack = Layer.provideMerge(SubscriptionManagerLive, MemoryTevm)
+    provide SubStack {
+      const subs = try SubscriptionManager
+      const subId = try subs.subscribeNewHeads("50 millis")
+      const active = try subs.activeIds()
+      try Effect.try(() => assert.deepStrictEqual(active, [subId]))
+
+      const listener = fork Stream.runCollect(Stream.take(subs.notifications, 2))
+      try Effect.yieldNow
+      try tevmMine({ blocks: 2 })
+      try TestClock.adjust("100 millis")
+
+      const events = try join listener
+      try Effect.try(() => assert.strictEqual(events.length, 2))
+      try Effect.try(() => assert.strictEqual(events[0]?._tag, "NewHead"))
+
+      const removed = try subs.unsubscribe(subId)
+      try Effect.try(() => assert.strictEqual(removed, true))
+      const afterIds = try subs.activeIds()
+      try Effect.try(() => assert.deepStrictEqual(afterIds, []))
+    }
+  })
+
+  it.effect("dispatches Engine API methods over injected Transport", effect () => {
+    const engineMock = testTransport(effect (method) => {
+      if (method === "engine_exchangeCapabilities") {
+        return ["engine_forkchoiceUpdatedV3", "engine_newPayloadV3"]
+      }
+      if (method === "engine_forkchoiceUpdatedV3") {
+        return {
+          payloadStatus: { status: "VALID", latestValidHash: null, validationError: null },
+          payloadId: null,
+        }
+      }
+      return null
+    })
+
+    provide engineMock {
+      const caps = try engineExchangeCapabilities(["engine_newPayloadV3"])
+      try Effect.try(() => assert.strictEqual(caps.length, 2))
+      const zeroHash = "0x0000000000000000000000000000000000000000000000000000000000000000" as const
+      const fcu = try engineForkchoiceUpdated("V3", {
+        headBlockHash: zeroHash,
+        safeBlockHash: zeroHash,
+        finalizedBlockHash: zeroHash,
+      })
+      try Effect.try(() => assert.strictEqual(fcu.payloadStatus.status, "VALID"))
+    }
+  })
+})

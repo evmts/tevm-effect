@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import {
   AnvilCommon,
+  bindContract,
   blockStream,
   debugTraceCall,
   ethCall,
@@ -10,6 +11,7 @@ import {
   getChainId,
   getCode,
   getStorageAt,
+  makePredeploysLayer,
   restoreStateFromStorage,
   saveStateToStorage,
   sendTransaction,
@@ -21,10 +23,13 @@ import {
   tevmSetAccount,
   tevmSetBalance,
   TevmCoreLive,
+  TevmEngineLayer,
+  TransportWithPredeploys,
   withChainId,
   withImpersonation,
   withSnapshot,
 } from "../index.vibe"
+import { toVoltaireTransport, VoltaireAbiCodecLive } from "../voltaire/index.vibe"
 import { ZevmBackendNode } from "./node.vibe"
 import { findLocalZevmModulePath } from "./locate-zevm.ts"
 
@@ -134,6 +139,56 @@ describe.skipIf(zevmModulePath === undefined)("Real Native ZEVM Integration (Nod
       const head = try getBlockNumber()
       const blocks = try Stream.runCollect(blockStream({ fromBlock: 0n, toBlock: head }))
       try Effect.try(() => assert.strictEqual(BigInt(blocks.length), head + 1n))
+    }
+  })
+
+  it.effect("executes a Layer-predeployed contract via VoltaireAbiCodecLive and Voltaire batch bridge on native ZEVM", effect () => {
+    const predeployAddr = "0x0000000000000000000000000000000000004242" as const
+    const answerAbi = [
+      {
+        type: "function",
+        name: "answer",
+        inputs: [],
+        outputs: [{ name: "", type: "uint256" }],
+      },
+    ] as const
+
+    const PredeployedNative = Layer.merge(
+      Layer.provide(
+        TransportWithPredeploys,
+        Layer.merge(
+          Layer.provide(
+            TevmEngineLayer,
+            Layer.merge(
+              Layer.provide(withChainId(31337), AnvilCommon),
+              ZevmBackendNode({ modulePath: zevmModulePath }),
+            ),
+          ),
+          makePredeploysLayer([
+            {
+              name: "AnswerContract",
+              address: predeployAddr,
+              deployedBytecode: "0x602a60005260206000f3",
+            },
+          ]),
+        ),
+      ),
+      VoltaireAbiCodecLive,
+    )
+
+    provide PredeployedNative {
+      const contract = bindContract({ address: predeployAddr, abi: answerAbi })
+      const value = try contract.read<bigint>("answer")
+      try Effect.try(() => assert.strictEqual(value, 42n))
+
+      const vt = try toVoltaireTransport()
+      const batch = try vt.requestBatch([
+        { method: "eth_chainId" },
+        { method: "eth_blockNumber" },
+      ])
+      try Effect.try(() => assert.strictEqual(batch.length, 2))
+      try Effect.try(() => assert.strictEqual(batch[0]?._tag, "Ok"))
+      try Effect.try(() => assert.strictEqual(batch[1]?._tag, "Ok"))
     }
   })
 })

@@ -1,0 +1,79 @@
+// NonceManager service: concurrent, fiber-safe monotonic nonce coordinator.
+// Uses an Effect Semaphore + Ref<Map<string, bigint>> so `for concurrent` transaction
+// bursts never suffer nonce collisions, syncing lazily from `eth_getTransactionCount`.
+
+import { getTransactionCount } from "../actions/eth.vibe"
+import { CodecError, TransportError } from "../errors.vibe"
+import type { Address } from "../types.vibe"
+import { Transport } from "./transport.vibe"
+
+export service NonceManager {
+  static readonly key = "@tevm/effect/NonceManager"
+  /** Peek the current tracked nonce for `address` (syncing from chain if unseen). */
+  readonly peek: (address: Address) => bigint!(TransportError | CodecError)
+  /** Atomically reserve and increment the next nonce for `address`. */
+  readonly consume: (address: Address) => bigint!(TransportError | CodecError)
+  /** Clear cached nonce for `address` so the next call re-syncs from chain. */
+  readonly reset: (address: Address) => void!never
+  /** Clear all cached nonces. */
+  readonly resetAll: () => void!never
+}
+
+/** Live fiber-safe `NonceManager` Layer backed by `Transport`. */
+export const NonceManagerLive = Layer.effect(
+  NonceManager,
+  effect {
+    const transport = try Transport
+    const lock = try Semaphore.make(1)
+    const cacheRef = try Ref.make(new Map<string, bigint>())
+
+    effect function loadOrFetch(address: Address): bigint!(TransportError | CodecError) {
+      const key = address.toLowerCase()
+      const map = try Ref.get(cacheRef)
+      const existing = map.get(key)
+      if (existing !== undefined) return existing
+      provide Transport = transport {
+        const onChain = try getTransactionCount(address, "pending")
+        try Ref.update(cacheRef, (m) => {
+          const next = new Map(m)
+          next.set(key, onChain)
+          return next
+        })
+        return onChain
+      }
+    }
+
+    return {
+      effect peek(address: Address) {
+        return try lock.withPermits(1)(loadOrFetch(address))
+      },
+      effect consume(address: Address) {
+        return try lock.withPermits(1)(
+          effect {
+            const current = try loadOrFetch(address)
+            const key = address.toLowerCase()
+            try Ref.update(cacheRef, (m) => {
+              const next = new Map(m)
+              next.set(key, current + 1n)
+              return next
+            })
+            return current
+          },
+        )
+      },
+      effect reset(address: Address) {
+        const key = address.toLowerCase()
+        try lock.withPermits(1)(
+          Ref.update(cacheRef, (m) => {
+            const next = new Map(m)
+            next.delete(key)
+            return next
+          }),
+        )
+      },
+      effect resetAll() {
+        try lock.withPermits(1)(Ref.set(cacheRef, new Map<string, bigint>()))
+      },
+    }
+  },
+)

@@ -1,0 +1,115 @@
+// Platform-agnostic JSON-RPC subscription multiplexer (`eth_subscribe` / `eth_unsubscribe`).
+// Built purely on Effect `Stream`, `PubSub`, `Ref`, and `Fiber` — zero Node `ws` imports!
+// Plug directly into any WebSocket transport (Node, Bun, Cloudflare Durable Objects, Deno).
+
+import { CodecError, TransportError } from "../errors.vibe"
+import { toQuantityHex } from "../hex.vibe"
+import { Transport } from "../services/transport.vibe"
+import { blockStream, logStream } from "../streams/index.vibe"
+import type { BlockObject, LogFilter, LogObject, QuantityHex } from "../types.vibe"
+
+export data SubscriptionNotification {
+  NewHead { subscriptionId: QuantityHex; block: BlockObject<false> }
+  Log { subscriptionId: QuantityHex; log: LogObject }
+}
+
+export service SubscriptionManager {
+  static readonly key = "@tevm/effect/SubscriptionManager"
+  /** Subscribe to newly mined canonical block headers (`eth_subscribe("newHeads")`). */
+  readonly subscribeNewHeads: (pollInterval?: Duration.Input) => QuantityHex!never
+  /** Subscribe to matching logs (`eth_subscribe("logs", filter)`). */
+  readonly subscribeLogs: (
+    filter?: Omit<LogFilter, "fromBlock" | "toBlock" | "blockHash">,
+    pollInterval?: Duration.Input,
+  ) => QuantityHex!never
+  /** Cancel an active subscription by ID (`eth_unsubscribe`). */
+  readonly unsubscribe: (subscriptionId: QuantityHex) => boolean!never
+  /** Active subscription IDs. */
+  readonly activeIds: () => (readonly QuantityHex[])!never
+  /** Live Effect Stream of notifications across all active subscriptions. */
+  readonly notifications: Stream.Stream<SubscriptionNotification>
+}
+
+/**
+ * Live scoped `SubscriptionManager` Layer backed by any injected `Transport`.
+ * Automatically interrupts every subscription fiber and shuts down the notification
+ * `PubSub` when the enclosing Scope exits.
+ */
+export const SubscriptionManagerLive = Layer.effect(
+  SubscriptionManager,
+  effect {
+    const transport = try Transport
+    const scope = try Effect.scope
+    const nextIdRef = try Ref.make(0n)
+    const fibersRef = try Ref.make(new Map<string, Fiber.Fiber<void, TransportError | CodecError>>())
+    const bus = try PubSub.unbounded<SubscriptionNotification>()
+
+    try Effect.addFinalizer(() =>
+      effect {
+        const active = try Ref.getAndSet(fibersRef, new Map())
+        for (const fib of active.values()) {
+          try Fiber.interrupt(fib)
+        }
+        try PubSub.shutdown(bus)
+      }
+    )
+
+    return {
+      effect subscribeNewHeads(pollInterval: Duration.Input = "50 millis") {
+        const idNum = try Ref.updateAndGet(nextIdRef, (n) => n + 1n)
+        const subscriptionId = toQuantityHex(idNum)
+        const runner = effect {
+          provide Transport = transport {
+            for try (const block of blockStream<false>({ pollInterval })) {
+              try PubSub.publish(bus, SubscriptionNotification.NewHead({ subscriptionId, block }))
+            }
+          }
+        }
+        const fib = fork.in(scope) runner
+        try Ref.update(fibersRef, (m) => {
+          const next = new Map(m)
+          next.set(subscriptionId, fib)
+          return next
+        })
+        return subscriptionId
+      },
+      effect subscribeLogs(
+        filter: Omit<LogFilter, "fromBlock" | "toBlock" | "blockHash"> = {},
+        pollInterval: Duration.Input = "50 millis",
+      ) {
+        const idNum = try Ref.updateAndGet(nextIdRef, (n) => n + 1n)
+        const subscriptionId = toQuantityHex(idNum)
+        const runner = effect {
+          provide Transport = transport {
+            for try (const log of logStream(filter, { pollInterval })) {
+              try PubSub.publish(bus, SubscriptionNotification.Log({ subscriptionId, log }))
+            }
+          }
+        }
+        const fib = fork.in(scope) runner
+        try Ref.update(fibersRef, (m) => {
+          const next = new Map(m)
+          next.set(subscriptionId, fib)
+          return next
+        })
+        return subscriptionId
+      },
+      effect unsubscribe(subscriptionId: QuantityHex) {
+        const map = try Ref.get(fibersRef)
+        const fib = map.get(subscriptionId)
+        if (fib === undefined) return false
+        try Ref.update(fibersRef, (m) => {
+          const next = new Map(m)
+          next.delete(subscriptionId)
+          return next
+        })
+        try Fiber.interrupt(fib)
+        return true
+      },
+      effect activeIds() {
+        return Array.from((try Ref.get(fibersRef)).keys()) as QuantityHex[]
+      },
+      notifications: Stream.fromPubSub(bus),
+    }
+  },
+)

@@ -1,0 +1,129 @@
+// ZEVM Engine API JSON-RPC actions (aligned with ZEVM JSON-RPC contract section 8.7).
+// Every action depends solely on the injected `Transport` service.
+
+import { TransportError } from "../errors.vibe"
+import { toQuantityHex } from "../hex.vibe"
+import { Transport } from "../services/transport.vibe"
+import type { Hash32, Hex } from "../types.vibe"
+
+export interface ForkchoiceStateV1 {
+  readonly headBlockHash: Hash32
+  readonly safeBlockHash: Hash32
+  readonly finalizedBlockHash: Hash32
+}
+
+export interface PayloadStatusV1 {
+  readonly status: "VALID" | "INVALID" | "SYNCING" | "ACCEPTED" | "INVALID_BLOCK_HASH"
+  readonly latestValidHash: Hash32 | null
+  readonly validationError: string | null
+}
+
+export interface ForkchoiceUpdatedResult {
+  readonly payloadStatus: PayloadStatusV1
+  readonly payloadId: Hex | null
+}
+
+export interface ClientVersionV1 {
+  readonly code: string
+  readonly name: string
+  readonly version: string
+  readonly commit: Hex
+}
+
+export effect function engineExchangeCapabilities(
+  capabilities: readonly string[],
+): (readonly string[])!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<readonly string[]>("engine_exchangeCapabilities", [capabilities])
+}
+
+export effect function engineExchangeTransitionConfigurationV1(
+  config: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>>!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Readonly<Record<string, unknown>>>(
+    "engine_exchangeTransitionConfigurationV1",
+    [config],
+  )
+}
+
+export effect function engineGetClientVersionV1(
+  clientVersion: ClientVersionV1,
+): (readonly ClientVersionV1[])!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<readonly ClientVersionV1[]>("engine_getClientVersionV1", [
+    clientVersion,
+  ])
+}
+
+export effect function engineForkchoiceUpdated(
+  version: "V1" | "V2" | "V3" | "V4",
+  forkchoiceState: ForkchoiceStateV1,
+  payloadAttributes?: Readonly<Record<string, unknown>> | null,
+): ForkchoiceUpdatedResult!TransportError!Transport {
+  const transport = try Transport
+  const params: unknown[] = payloadAttributes === undefined ? [forkchoiceState] : [forkchoiceState, payloadAttributes]
+  return try transport.request<ForkchoiceUpdatedResult>(
+    `engine_forkchoiceUpdated${version}`,
+    params,
+  )
+}
+
+export effect function engineNewPayload(
+  version: "V1" | "V2" | "V3" | "V4" | "V5",
+  executionPayload: Readonly<Record<string, unknown>>,
+  expectedBlobVersionedHashes?: readonly Hash32[],
+  parentBeaconBlockRoot?: Hash32,
+  executionRequests?: readonly Hex[],
+): PayloadStatusV1!TransportError!Transport {
+  const transport = try Transport
+  const params: unknown[] = [executionPayload]
+  if (expectedBlobVersionedHashes !== undefined) params.push(expectedBlobVersionedHashes)
+  if (parentBeaconBlockRoot !== undefined) params.push(parentBeaconBlockRoot)
+  if (executionRequests !== undefined) params.push(executionRequests)
+  return try transport.request<PayloadStatusV1>(`engine_newPayload${version}`, params)
+}
+
+export effect function engineGetPayload(
+  version: "V1" | "V2" | "V3" | "V4" | "V5" | "V6",
+  payloadId: Hex,
+): Readonly<Record<string, unknown>>!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<Readonly<Record<string, unknown>>>(`engine_getPayload${version}`, [
+    payloadId,
+  ])
+}
+
+export effect function engineGetPayloadBodiesByHash(
+  version: "V1" | "V2",
+  blockHashes: readonly Hash32[],
+): (readonly (Readonly<Record<string, unknown>> | null)[])!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<readonly (Readonly<Record<string, unknown>> | null)[]>(
+    `engine_getPayloadBodiesByHash${version}`,
+    [blockHashes],
+  )
+}
+
+export effect function engineGetPayloadBodiesByRange(
+  version: "V1" | "V2",
+  startBlockNumber: bigint | number,
+  count: bigint | number,
+): (readonly (Readonly<Record<string, unknown>> | null)[])!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<readonly (Readonly<Record<string, unknown>> | null)[]>(
+    `engine_getPayloadBodiesByRange${version}`,
+    [toQuantityHex(startBlockNumber), toQuantityHex(count)],
+  )
+}
+
+export effect function engineGetBlobs(
+  version: "V1" | "V2" | "V3",
+  versionedHashes: readonly Hash32[],
+): (readonly (Readonly<Record<string, unknown>> | null)[])!TransportError!Transport {
+  const transport = try Transport
+  return try transport.request<readonly (Readonly<Record<string, unknown>> | null)[]>(
+    `engine_getBlobs${version}`,
+    [versionedHashes],
+  )
+}

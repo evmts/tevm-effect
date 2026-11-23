@@ -14,6 +14,7 @@
     ],
     "outDir": "dist",
     "noEmitOnError": true,
+    "allowArbitraryExtensions": true,
     "rewriteRelativeImportExtensions": true,
     "skipLibCheck": true,
     "types": ["node"],
@@ -35,7 +36,9 @@
     "src/**/*.test.ts"
   ],
   "vibe": {
-    "severities": {},
+    "severities": {
+      "EK3858": "off"
+    },
     "sidecarDir": ".vibe/declarations"
   }
 }

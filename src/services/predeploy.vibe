@@ -1,0 +1,80 @@
+// Predeploys service: declarative, Layer-composed contract predeployment!
+// Inject arbitrary contracts (deployed bytecode, storage slots, balance, ABI) at
+// deterministic addresses as composable Effect Layers.
+
+import { tevmSetAccount } from "../actions/tevm.vibe"
+import { TransportError } from "../errors.vibe"
+import type { Abi, Address, Bytes32, Hex } from "../types.vibe"
+import { Transport } from "./transport.vibe"
+
+export interface PredeploySpec {
+  readonly name: string
+  readonly address: Address
+  readonly deployedBytecode: Hex
+  readonly abi?: Abi
+  readonly balance?: bigint
+  readonly nonce?: bigint
+  readonly storage?: Readonly<Record<Bytes32, Bytes32>>
+}
+
+export service Predeploys: readonly PredeploySpec[] {
+  static readonly key = "@tevm/effect/Predeploys"
+  static readonly defaultValue = (): readonly PredeploySpec[] => []
+}
+
+/** Create a Predeploys Layer with the given contract specs. */
+export function makePredeploysLayer(specs: readonly PredeploySpec[]) {
+  return Layer.succeed(Predeploys, specs)
+}
+
+/** Append one predeploy onto whatever `Predeploys` are already in context. */
+export function withPredeploy(spec: PredeploySpec) {
+  return Layer.effect(
+    Predeploys,
+    effect {
+      const existing = try Predeploys
+      return [...existing, spec]
+    },
+  )
+}
+
+/** Append multiple predeploys onto whatever `Predeploys` are already in context. */
+export function withPredeploys(specs: readonly PredeploySpec[]) {
+  return Layer.effect(
+    Predeploys,
+    effect {
+      const existing = try Predeploys
+      return [...existing, ...specs]
+    },
+  )
+}
+
+/** Install all registered `Predeploys` into the active ZEVM node via `Transport`. */
+export effect function installPredeploys(): (readonly PredeploySpec[])!TransportError!Transport {
+  const specs = try Predeploys
+  for (const spec of specs) {
+    try tevmSetAccount({
+      address: spec.address,
+      code: spec.deployedBytecode,
+      balance: spec.balance,
+      nonce: spec.nonce,
+      storage: spec.storage,
+    })
+  }
+  return specs
+}
+
+/**
+ * Layer decorator that wraps `Transport` and automatically installs every registered
+ * `PredeploySpec` on layer acquisition before any consumer runs a single RPC call!
+ */
+export const TransportWithPredeploys = Layer.effect(
+  Transport,
+  effect {
+    const transport = try Transport
+    provide Transport = transport {
+      try installPredeploys()
+    }
+    return transport
+  },
+)

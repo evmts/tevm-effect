@@ -29,18 +29,22 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "vibelang-source": "./src/index.vibe",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./platform/node": {
+      "vibelang-source": "./src/platform/node.vibe",
       "types": "./dist/platform/node.d.ts",
       "import": "./dist/platform/node.js"
     },
     "./testing": {
+      "vibelang-source": "./src/testing/index.vibe",
       "types": "./dist/testing/index.d.ts",
       "import": "./dist/testing/index.js"
     },
     "./voltaire": {
+      "vibelang-source": "./src/voltaire/index.vibe",
       "types": "./dist/voltaire/index.d.ts",
       "import": "./dist/voltaire/index.js"
     },
@@ -68,7 +72,8 @@
   },
   "peerDependencies": {
     "@effect/platform-node": "4.1.1",
-    "@evmts/zevm": ">=0.0.0"
+    "@evmts/zevm": ">=0.0.0",
+    "@tevm/voltaire": ">=0.4.0"
   },
   "peerDependenciesMeta": {
     "@effect/platform-node": {
@@ -76,11 +81,15 @@
     },
     "@evmts/zevm": {
       "optional": true
+    },
+    "@tevm/voltaire": {
+      "optional": true
     }
   },
   "devDependencies": {
     "@effect/platform-node": "4.1.1",
     "@effect/vitest": "4.1.1",
+    "@tevm/voltaire": "^0.4.0",
     "@types/node": "^22.15.0",
     "vibelang": "0.0.13",
     "vibelang-vite": "0.0.13",

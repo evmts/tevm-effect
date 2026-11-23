@@ -17,8 +17,26 @@ import {
   networkNameToCode,
   type NodeZevmBackendOptions,
 } from "./node-backend.ts"
+import { makeNodeHttpServerLayer } from "./node-server.ts"
+import { HttpRouter } from "effect/http"
+import { type JsonRpcHttpServerOptions, makeJsonRpcHttpRouter } from "../server/http.vibe"
 
 export type { NodeZevmBackendOptions }
+
+export interface ServeJsonRpcNodeOptions extends JsonRpcHttpServerOptions {
+  readonly port: number
+  readonly host?: string
+}
+
+/**
+ * Mount `makeJsonRpcHttpRouter` on Node's HTTP server via `@effect/platform-node`.
+ * Requires `Transport` (for example `TevmCoreLive` + `AnvilCommon` + `ZevmBackendNode()`).
+ */
+export function serveJsonRpcNode(options: ServeJsonRpcNodeOptions) {
+  const routes = makeJsonRpcHttpRouter(options)
+  const server = makeNodeHttpServerLayer({ port: options.port, host: options.host })
+  return Layer.provide(HttpRouter.serve(routes), server)
+}
 
 /**
  * Node.js `ZevmBackend` Layer backed by the native `@evmts/zevm` N-API addon.
