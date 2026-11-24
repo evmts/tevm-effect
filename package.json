@@ -89,6 +89,8 @@
   "devDependencies": {
     "@effect/platform-node": "4.1.1",
     "@effect/vitest": "4.1.1",
+    "@smthrs/cli": "1.0.0-rc.18",
+    "@smthrs/targets": "1.0.0-rc.18",
     "@tevm/voltaire": "^0.4.0",
     "@types/node": "^22.15.0",
     "vibelang": "0.0.13",

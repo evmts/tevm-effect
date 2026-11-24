@@ -1,0 +1,39 @@
+{
+  "blocks": [
+    {
+      "type": "text",
+      "title": "tevm-effect factory",
+      "text": "Effect-native, aggressively dependency-injected TEVM powered by ZEVM and Voltaire, written in VibeLang for Effect 4. Incremental build, typecheck, lint, format, and vitest targets replay from the Smithers cache; reviews enforce Layer DI, scoped EVM mutations, and JSON-RPC parity."
+    },
+    {
+      "type": "prompt",
+      "title": "Ask about tevm-effect",
+      "placeholder": "Describe a Layer, JSON-RPC, stream, or Voltaire issue or change…"
+    },
+    {
+      "type": "flows",
+      "title": "Review, reproduce, and probe"
+    },
+    {
+      "type": "links",
+      "links": [
+        {
+          "label": "Repository",
+          "url": "https://github.com/evmts/tevm-effect"
+        },
+        {
+          "label": "CI",
+          "url": "https://github.com/evmts/tevm-effect/actions/workflows/ci.yml"
+        },
+        {
+          "label": "ZEVM",
+          "url": "https://github.com/evmts/zevm"
+        },
+        {
+          "label": "Voltaire",
+          "url": "https://github.com/evmts/voltaire"
+        }
+      ]
+    }
+  ]
+}

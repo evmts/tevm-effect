@@ -1,0 +1,216 @@
+{
+  "summary": "tevm-effect: incremental VibeLang CI, Effect Layer DI and EVM correctness review, and weekly Effect/VibeLang/Voltaire drift probes.",
+  "flows": [
+    {
+      "id": "checks/review",
+      "description": "Review a tevm-effect change for Effect service/Layer DI discipline, ZEVM execution and JSON-RPC correctness, Voltaire interop, and VibeLang package output.",
+      "summary": "Review Effect Layer DI, scoped EVM resources, JSON-RPC correctness, Voltaire interop, and package output.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/checks/review/flow.mdx",
+      "capabilities": [
+        "fs:read:**"
+      ],
+      "model": null,
+      "modelInvocable": true,
+      "inputSchema": {
+        "dialect": "draft-2020-12",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "args"
+          ],
+          "additionalProperties": true
+        },
+        "definitions": {}
+      },
+      "flows": [
+        "coding/ReviewCheck"
+      ]
+    },
+    {
+      "id": "issue/repro",
+      "description": "Reproduce a tevm-effect defect in an Effect service, Layer, JSON-RPC action, stream, or Voltaire adapter with a minimal failing vitest before planning a fix.",
+      "summary": "Reproduce a service, action, stream, or Voltaire defect as a deterministic in-memory vitest.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/issue/repro/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "fs:write:src/**/*.test.vibe",
+        "proc:spawn:rg *",
+        "proc:spawn:jj --no-pager *",
+        "proc:spawn:pnpm *",
+        "proc:spawn:node *"
+      ],
+      "model": "sol",
+      "modelInvocable": true,
+      "inputSchema": {
+        "dialect": "draft-2020-12",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "args"
+          ],
+          "additionalProperties": true
+        },
+        "definitions": {}
+      },
+      "flows": [],
+      "budget": {
+        "tokens": 64000,
+        "milliseconds": 1800000
+      }
+    },
+    {
+      "id": "issue/poc",
+      "description": "Implement a bounded tevm-effect fix as an Effect service or Layer change with a focused failing-then-passing vitest regression.",
+      "summary": "Implement a bounded fix as a service or Layer change with a failing-then-passing regression.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/issue/poc/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "fs:write:**",
+        "proc:spawn:rg *",
+        "proc:spawn:jj --no-pager *",
+        "proc:spawn:pnpm *",
+        "proc:spawn:node *",
+        "proc:spawn:.smithers/node_modules/.bin/smthrs *"
+      ],
+      "model": "sol",
+      "modelInvocable": true,
+      "inputSchema": {
+        "dialect": "draft-2020-12",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "args"
+          ],
+          "additionalProperties": true
+        },
+        "definitions": {}
+      },
+      "flows": [],
+      "budget": {
+        "tokens": 100000,
+        "milliseconds": 3600000
+      }
+    },
+    {
+      "id": "pr-triage",
+      "description": "Triage a tevm-effect pull request from supplied metadata, diff, and CI evidence without executing untrusted PR code.",
+      "summary": "Assess pull request readiness from its diff and CI evidence without executing untrusted PR code.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/pr-triage/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "fs:write:.smithers/reports/pr-triage.json",
+        "proc:spawn:rg *"
+      ],
+      "model": "sol",
+      "modelInvocable": true,
+      "inputSchema": {
+        "dialect": "draft-2020-12",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "args"
+          ],
+          "additionalProperties": true
+        },
+        "definitions": {}
+      },
+      "flows": [],
+      "budget": {
+        "tokens": 64000,
+        "milliseconds": 600000
+      }
+    },
+    {
+      "id": "upstream-probe",
+      "description": "Probe new Effect, VibeLang, and Voltaire releases against tevm-effect in a scratch jj workspace and report API drift and test failures.",
+      "summary": "Probe new Effect, VibeLang, and Voltaire releases in a scratch workspace and report drift.",
+      "featured": true,
+      "kind": "mdx",
+      "path": ".smithers/flows/upstream-probe/flow.mdx",
+      "capabilities": [
+        "fs:read:**",
+        "fs:write:.smithers/reports/upstream-probe.json",
+        "proc:spawn:npm view *",
+        "proc:spawn:jj --no-pager *",
+        "proc:spawn:pnpm *",
+        "proc:spawn:rg *"
+      ],
+      "model": "sol",
+      "modelInvocable": true,
+      "inputSchema": {
+        "dialect": "draft-2020-12",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "args"
+          ],
+          "additionalProperties": true
+        },
+        "definitions": {}
+      },
+      "flows": [],
+      "budget": {
+        "tokens": 64000,
+        "milliseconds": 1800000
+      }
+    }
+  ],
+  "on": [
+    {
+      "event": "schedule:0 14 * * 1",
+      "flow": "upstream-probe",
+      "description": "Weekly Monday probe of new Effect, VibeLang, and Voltaire releases"
+    }
+  ],
+  "github": {
+    "mirror": "pull",
+    "issues": "read",
+    "changes": "send-upstream",
+    "protectedPaths": [
+      "package.json",
+      "pnpm-lock.yaml",
+      "src/services/evm.vibe",
+      "src/services/backend.vibe",
+      "src/actions/engine.vibe",
+      "src/platform",
+      ".smithers",
+      ".github/workflows"
+    ],
+    "maintainers": [
+      "roninjin10"
+    ]
+  }
+}

@@ -1,0 +1,31 @@
+---
+description: Probe new Effect, VibeLang, and Voltaire releases against tevm-effect in a scratch jj workspace and report API drift and test failures.
+capabilities: ["fs:read:**", "fs:write:.smithers/reports/upstream-probe.json", "proc:spawn:npm view *", "proc:spawn:jj --no-pager *", "proc:spawn:pnpm *", "proc:spawn:rg *"]
+model: sol
+budget:
+  tokens: 64000
+  milliseconds: 1800000
+---
+
+tevm-effect pins `effect` and `@effect/*` to one exact version, pins
+`vibelang`, `vibelang-vite`, and `vibelang-runtime` to one exact version, and
+accepts `@tevm/voltaire` within a caret range. Detect drift before it breaks
+consumers:
+
+1. Read the current pins from `package.json`. Use `npm view <name> dist-tags
+   --json` for `effect`, `@effect/platform-node`, `@effect/vitest`,
+   `vibelang`, `vibelang-vite`, `vibelang-runtime`, and `@tevm/voltaire`.
+2. If any has a newer `latest`, create a scratch workspace with
+   `jj --no-pager workspace add $TMPDIR/tevm-effect-upstream-probe`, bump only
+   those pins there (keep every `effect`/`@effect/*` pin identical and every
+   `vibelang*` pin identical), run `pnpm install`, then `pnpm run build`,
+   `pnpm run typecheck`, `pnpm run lint`, and `pnpm test`.
+3. Record each command's exit status and the first diagnostics. Forget the
+   scratch workspace afterward (`jj --no-pager workspace forget`), and never
+   push, commit to `main`, or edit the main checkout.
+
+Write only `.smithers/reports/upstream-probe.json`:
+{"current":{"effect":"...","vibelang":"...","@tevm/voltaire":"..."},"latest":{},"bumped":[],"results":{"build":"passed|failed|skipped","typecheck":"...","lint":"...","test":"..."},"regressions":[],"upstream_defects":[],"summary":"..."}
+Mark steps `skipped` when nothing is newer; never fabricate pass results.
+Attribute compiler failures to VibeLang and runtime failures to Effect or
+Voltaire with a minimal reproduction.

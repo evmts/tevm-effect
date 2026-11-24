@@ -22,3 +22,37 @@ jobs:
       - run: pnpm run typecheck
       - run: pnpm run lint
       - run: pnpm test
+
+  # Dogfoods Smithers: every target in PACKAGE.ts (build, typecheck, lint,
+  # format, test, factory drift) through `smthrs ci '//...'`. Unchanged targets
+  # replay from .smithers/cache (kept across runs by actions/cache) and from
+  # build.smithers.sh when the cache tokens are configured; pull requests only
+  # read the remote cache.
+  smithers:
+    name: "smthrs ci //..."
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26.4.0"
+          cache: "pnpm"
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/cache@v4
+        with:
+          path: .smithers/cache
+          key: smthrs-${{ runner.os }}-${{ github.sha }}
+          restore-keys: smthrs-${{ runner.os }}-
+      - name: smthrs ci '//...'
+        run: pnpm exec smthrs ci '//...' --verbose
+        env:
+          SMITHERS_CACHE_READ_TOKEN: ${{ secrets.SMITHERS_CACHE_READ_TOKEN }}
+          SMITHERS_CACHE_WRITE_TOKEN: ${{ github.event_name == 'push' && secrets.SMITHERS_CACHE_WRITE_TOKEN || '' }}

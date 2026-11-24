@@ -12,3 +12,7 @@
   - `pnpm run typecheck`
   - `pnpm run lint`
   - `pnpm test`
+- **Smithers (incremental CI)**: `PACKAGE.ts` mirrors the scripts above as cached targets; `.smithers/WORKSPACE.ts` declares the workspace and remote cache (`https://build.smithers.sh`).
+  - `pnpm exec smthrs ci '//...'` runs build, typecheck, lint, format, test, and factory drift; unchanged targets replay from `.smithers/cache`.
+  - `pnpm exec smthrs run //:test-native` runs the native ZEVM / voltaire-effect suites against sibling `../zevm` and `../voltaire` checkouts (excluded from the cached `//:test`).
+  - After editing `.smithers/FACTORY.ts` or `.smithers/flows/**`, regenerate with `pnpm exec smthrs target //:factory-write --write`.

@@ -3,3 +3,4 @@ overrides:
 allowBuilds:
   dprint: true
   es5-ext: false
+  esbuild: true
