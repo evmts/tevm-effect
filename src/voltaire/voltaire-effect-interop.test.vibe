@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import { AnvilCommon, makePredeploysLayer, TevmEngineLayer, TransportWithPredeploys, withChainId } from "../index.vibe"
-import { findLocalZevmModulePath } from "../platform/locate-zevm.ts"
+import { findLocalZevmModulePath, hasInstalledZevmPackage } from "../platform/locate-zevm.ts"
 import { ZevmBackendNode } from "../platform/node.vibe"
 import { ZevmBackendMemory } from "../testing/index.vibe"
 import { toEip1193Provider } from "./index.vibe"
@@ -8,6 +8,7 @@ import { findLocalVoltaireEffectPath, loadVoltaireEffect } from "./locate-voltai
 
 const voltaireEffectPath = findLocalVoltaireEffectPath()
 const zevmModulePath = findLocalZevmModulePath()
+const hasNativeZevm = hasInstalledZevmPackage() || zevmModulePath !== undefined
 
 error InteropLoadError {
   message: string
@@ -26,7 +27,9 @@ describe.skipIf(voltaireEffectPath === undefined)(
         })
 
         const predeployAddr = "0x0000000000000000000000000000000000004242" as const
-        const backendLayer = zevmModulePath !== undefined
+        const backendLayer = hasInstalledZevmPackage()
+          ? ZevmBackendNode()
+          : zevmModulePath !== undefined
           ? ZevmBackendNode({ modulePath: zevmModulePath })
           : ZevmBackendMemory
 
@@ -81,7 +84,7 @@ describe.skipIf(voltaireEffectPath === undefined)(
           try Effect.try(() => assert.strictEqual(blockNum, 0n))
           try Effect.try(() => assert.strictEqual(bal, 5000n))
 
-          if (zevmModulePath !== undefined) {
+          if (hasNativeZevm) {
             const answerContract = try Effect.mapError(
               veContract(predeployAddr, [
                 {

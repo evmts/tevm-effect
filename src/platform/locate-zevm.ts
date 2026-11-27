@@ -1,7 +1,9 @@
-// Real native ZEVM integration test helper: locates the sibling ../zevm checkout
-// when present on a developer machine without hard-coding a dependency in package.json.
+// Native ZEVM resolution helper for tests:
+// prefers explicit ZEVM_MODULE_PATH override, then the installed `@evmts/zevm`
+// package (0.1.0+ from npm), and finally a sibling ../zevm dev checkout.
 
 import { existsSync } from "node:fs"
+import { createRequire } from "node:module"
 import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -14,4 +16,15 @@ export function findLocalZevmModulePath(): string | undefined {
   const sibling = resolve(here, "..", "..", "..", "zevm", "npm", "zevm", "src", "index.js")
   if (existsSync(sibling)) return sibling
   return undefined
+}
+
+/** @throws {never} */
+export function hasInstalledZevmPackage(): boolean {
+  try {
+    const req = createRequire(import.meta.url)
+    req.resolve("@evmts/zevm")
+    return true
+  } catch {
+    return false
+  }
 }

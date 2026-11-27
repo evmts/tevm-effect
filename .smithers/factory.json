@@ -186,6 +186,20 @@
         "tokens": 64000,
         "milliseconds": 1800000
       }
+    },
+    {
+      "id": "uphill",
+      "description": "Score continuous footprint, quality, and architecture metrics with Uphill.",
+      "summary": null,
+      "featured": false,
+      "kind": "ts",
+      "path": ".smithers/flows/uphill/flow.ts",
+      "capabilities": [
+        "sandbox:job"
+      ],
+      "model": null,
+      "modelInvocable": true,
+      "flows": []
     }
   ],
   "on": [

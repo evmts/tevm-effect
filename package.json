@@ -72,7 +72,7 @@
   },
   "peerDependencies": {
     "@effect/platform-node": "4.1.1",
-    "@evmts/zevm": ">=0.0.0",
+    "@evmts/zevm": ">=0.1.0",
     "@tevm/voltaire": ">=0.4.0"
   },
   "peerDependenciesMeta": {
@@ -89,6 +89,7 @@
   "devDependencies": {
     "@effect/platform-node": "4.1.1",
     "@effect/vitest": "4.1.1",
+    "@evmts/zevm": "^0.1.0",
     "@smthrs/cli": "1.0.0-rc.18",
     "@smthrs/targets": "1.0.0-rc.18",
     "@tevm/voltaire": "^0.4.0",

@@ -81,13 +81,13 @@ export async function loadZevmModule(options: NodeZevmBackendOptions = {}): Prom
   }
 
   try {
-    const mod = (await import("@evmts/zevm")) as unknown as Partial<RawZevmModule>
+    const mod: Partial<RawZevmModule> = await import("@evmts/zevm")
     assertValidZevmModule(mod, "@evmts/zevm")
     return mod
   } catch (esmErr) {
     try {
       const req = createRequire(import.meta.url)
-      const mod = req("@evmts/zevm") as unknown as Partial<RawZevmModule>
+      const mod = req("@evmts/zevm") as Partial<RawZevmModule>
       assertValidZevmModule(mod, "@evmts/zevm")
       return mod
     } catch {

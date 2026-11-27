@@ -31,16 +31,20 @@ import {
 } from "../index.vibe"
 import { toVoltaireTransport, VoltaireAbiCodecLive } from "../voltaire/index.vibe"
 import { ZevmBackendNode } from "./node.vibe"
-import { findLocalZevmModulePath } from "./locate-zevm.ts"
+import { findLocalZevmModulePath, hasInstalledZevmPackage } from "./locate-zevm.ts"
 
-const zevmModulePath = findLocalZevmModulePath()
+const explicitZevmPath = findLocalZevmModulePath()
+const zevmAvailable = hasInstalledZevmPackage() || explicitZevmPath !== undefined
+const zevmBackendLayer = hasInstalledZevmPackage()
+  ? ZevmBackendNode()
+  : ZevmBackendNode({ modulePath: explicitZevmPath })
 
-describe.skipIf(zevmModulePath === undefined)("Real Native ZEVM Integration (Node-API Zig Binary)", () => {
+describe.skipIf(!zevmAvailable)("Real Native ZEVM Integration (Node-API Zig Binary)", () => {
   const NativeTevm = Layer.provideMerge(
     TevmCoreLive,
     Layer.merge(
       Layer.provide(withChainId(31337), AnvilCommon),
-      ZevmBackendNode({ modulePath: zevmModulePath }),
+      zevmBackendLayer,
     ),
   )
 
@@ -161,7 +165,7 @@ describe.skipIf(zevmModulePath === undefined)("Real Native ZEVM Integration (Nod
             TevmEngineLayer,
             Layer.merge(
               Layer.provide(withChainId(31337), AnvilCommon),
-              ZevmBackendNode({ modulePath: zevmModulePath }),
+              zevmBackendLayer,
             ),
           ),
           makePredeploysLayer([

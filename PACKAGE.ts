@@ -80,31 +80,31 @@ const format = S.Shell.Test({
   data: [config, sources, tests, declarations]
 })
 
-// Suites that load sibling checkouts outside the repository (../zevm native
-// Node-API binary, ../voltaire voltaire-effect dist) or ZEVM_MODULE_PATH /
-// VOLTAIRE_EFFECT_PATH. Those files are not target inputs, so the cached
-// `test` target excludes them and `test-native` runs them on demand.
-const nativeSuites = ["src/platform/zevm-native.test.vibe", "src/voltaire/voltaire-effect-interop.test.vibe"]
+// Suites that still load sibling checkouts outside the repository (e.g.
+// voltaire-effect v2 via VOLTAIRE_EFFECT_PATH until published to npm).
+// Native ZEVM tests run hermetically via the installed `@evmts/zevm@^0.1.0`
+// devDependency inside the cached `//:test` target!
+const externalSuites = ["src/voltaire/voltaire-effect-interop.test.vibe"]
 
-// `pnpm test` minus the native suites: vitest through vibelang-vite.
+// `pnpm test` minus external sibling suites: vitest through vibelang-vite.
 // Unconfined: vite writes its bundled config to node_modules/.vite-temp.
 const test = S.Shell.Test({
   ...common,
   sandbox: "none",
-  summary: "Run the hermetic vitest suite (services, actions, streams, server, Voltaire) through vibelang-vite.",
+  summary: "Run the hermetic vitest suite (including native @evmts/zevm@0.1.0) through vibelang-vite.",
   bin: S.NodeModule.Bin("vitest"),
-  args: ["run", ...nativeSuites.flatMap((suite) => ["--exclude", suite])],
+  args: ["run", ...externalSuites.flatMap((suite) => ["--exclude", suite])],
   data: [config, sources, tests]
 })
 
-// Real native ZEVM and voltaire-effect interop against sibling checkouts.
+// Sibling-checkout interop tests (e.g. voltaire-effect v2 before npm publish).
 // Manual and uncached: `smthrs run //:test-native`.
 const testNative = S.Shell.Run({
   ...common,
   sandbox: "none",
-  summary: "Run the native ZEVM and voltaire-effect interop suites against sibling ../zevm and ../voltaire checkouts.",
+  summary: "Run the native ZEVM and voltaire-effect interop suites.",
   bin: S.NodeModule.Bin("vitest"),
-  args: ["run", ...nativeSuites],
+  args: ["run", "src/platform/zevm-native.test.vibe", ...externalSuites],
   data: [config, sources, tests],
   manual: true
 })
