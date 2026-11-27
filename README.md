@@ -1,6 +1,10 @@
 # tevm-effect (`@tevm/effect`)
 
-An Effect-native, aggressively dependency-injected Ethereum execution & developer node powered by **[ZEVM](https://github.com/evmts/zevm)** and **[Voltaire](https://github.com/evmts/voltaire)** (`@tevm/voltaire` + `voltaire-effect` v2), written in **[VibeLang](https://vibelang.sh)** targeting **Effect 4** (emitting standard ESM JavaScript + `.d.ts` declarations + `"vibelang-source"` conditions for both VibeLang and Effect 4 TypeScript consumers).
+An Effect-native, aggressively dependency-injected Ethereum execution & developer node powered by **[ZEVM](https://github.com/evmts/zevm)** and **[Voltaire](https://github.com/evmts/voltaire)** (`@tevm/voltaire`), written in **[VibeLang](https://vibelang.sh)** targeting **Effect 4** (emitting standard ESM JavaScript + `.d.ts` declarations + `"vibelang-source"` conditions for both VibeLang and Effect 4 TypeScript consumers).
+
+## Upgrading from the legacy package
+
+Version 2 introduces a new public API built on Effect 4. Applications using the legacy utilities can pin their existing 1.x prerelease while migrating. Import the Node backend from `@tevm/effect/platform/node` and the in-memory backend from `@tevm/effect/testing`.
 
 ## Architecture — Everything Is a Composable Effect Service
 
