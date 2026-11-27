@@ -1,0 +1,62 @@
+# Continuous metrics and hill climbing for @tevm/effect.
+# Scripts run from the repository root and append metric lines to $UPHILL_METRICS.
+
+footprint:
+  run: bun .agents/uphill/metrics/footprint.ts
+  title: Footprint
+  description: Keep each public export surface lean and every VibeLang module compact.
+  # Gzipped source bytes per public export surface (package.json exports).
+  # Targets derive from keeping core browser/Worker surfaces lightweight and modular.
+  surface-bytes:
+    poor: 40kB
+    description: Keep each package export surface small and modular; split unrelated RPC domains or adapters rather than growing a single entry surface.
+  # Source lines per non-test module under src/ (TigerStyle modularity limit: target <= 250 lines).
+  module-lines:
+    poor: 500
+    description: Keep every source module under 250 lines by decomposing large backends and RPC namespaces into focused files.
+  # Tripwire counts for dependency surface and exported symbols (no target; diffs surface in review).
+  runtime-deps:
+    description: Keep production runtime dependencies minimal (Effect + VibeLang runtime only); push vendor bindings to optional peerDependencies.
+
+quality:
+  run: bun .agents/uphill/metrics/quality.ts
+  title: Quality
+  description: Enforce aggressive Effect DI, typed VibeLang errors, strict types, and TigerStyle function limits.
+  # Core modules outside src/platform/ must never import node:* or rely on Node globals (AGENTS.md).
+  platform-isolation:
+    weight: 2
+    description: Keep core src/ modules 100% platform-agnostic (zero node:* imports or Node-only globals outside src/platform/).
+  # Expected failures must use typed VibeLang error declarations (Data.TaggedError), not raw throw new Error (AGENTS.md).
+  typed-errors:
+    weight: 2
+    description: Model every failure as a typed VibeLang error (Data.TaggedError) instead of raw `throw new Error(...)`.
+  # Disallow type-safety escape hatches (`as any`, `: any`, `as unknown as`, `@ts-ignore`, `@ts-expect-error`).
+  type-escape-hatches:
+    weight: 2
+    description: Avoid `any`, double casts (`as unknown as`), and `@ts-ignore`/`@ts-expect-error`; decode external payloads with schemas or type guards.
+  # TigerStyle: every function body should fit on one screen (<= 70 lines).
+  function-length:
+    description: Keep every function at or under 70 lines (TigerStyle); extract cohesive helpers for complex state or RPC handlers.
+  # Library code must never run Effects internally (Effect.runSync/runPromise/runFork belong only at app boundaries).
+  effect-boundaries:
+    description: Never call `Effect.runSync`, `Effect.runPromise`, or `Effect.runFork` inside library modules; return Effects and compose Layers.
+  # Source hygiene: no stray console.*, unresolved TODO/FIXME markers, or lines exceeding 120 characters.
+  hygiene:
+    description: Keep source files free of stray `console.*` calls, `TODO`/`FIXME` comments, and lines over 120 characters.
+
+architecture:
+  run: bun .agents/uphill/metrics/architecture.ts
+  title: Architecture & Testing
+  description: Maintain colocated test depth across every subsystem and keep public docs synchronized with exports.
+  # Every src/ subsystem directory must have colocated test files.
+  subsystem-tests:
+    weight: 2
+    description: Every subsystem under src/ must ship colocated `.test.vibe` or `.test.ts` suites exercising its Layers and error paths.
+  # Test-to-source line percentage per subsystem (ambitious target: >= 60% test-to-source ratio).
+  test-ratio:
+    better: higher
+    poor: 20
+    description: Maintain at least a 60% test-to-source line ratio in every subsystem under src/.
+  # Verify every package.json export maps to an existing source file and all local Markdown links resolve.
+  docs-and-exports:
+    description: Keep package.json export source paths and local Markdown links in README.md and AGENTS.md valid.

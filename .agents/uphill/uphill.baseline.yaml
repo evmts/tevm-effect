@@ -1,0 +1,89 @@
+# Each measurement's `baseline`, the size, count, or check `uphill --update` accepted, and its
+# `target`. Edit a target here, and each run reports what changed since the baseline.
+
+footprint:
+  surface-bytes:
+    "*": { target: 12kB }
+    ".": { baseline: 30925B, target: 25kB }
+    "./platform/node": { baseline: 3053B }
+    "./testing": { baseline: 7281B }
+    "./voltaire": { baseline: 5378B }
+  module-lines:
+    "*": { target: 250 }
+    src/actions/contract.vibe: { baseline: 199 }
+    src/actions/debug.vibe: { baseline: 49 }
+    src/actions/engine.vibe: { baseline: 130 }
+    src/actions/eth.vibe: { baseline: 394 }
+    src/actions/light.vibe: { baseline: 80 }
+    src/actions/tevm.vibe: { baseline: 478 }
+    src/errors.vibe: { baseline: 264 }
+    src/hex.vibe: { baseline: 140 }
+    src/index.vibe: { baseline: 42 }
+    src/layers.vibe: { baseline: 30 }
+    src/platform/locate-zevm.ts: { baseline: 18 }
+    src/platform/node-backend.ts: { baseline: 112 }
+    src/platform/node-server.ts: { baseline: 14 }
+    src/platform/node.vibe: { baseline: 184 }
+    src/server/http.vibe: { baseline: 104 }
+    src/server/subscriptions.vibe: { baseline: 116 }
+    src/services/backend.vibe: { baseline: 55 }
+    src/services/codec.vibe: { baseline: 299 }
+    src/services/common.vibe: { baseline: 217 }
+    src/services/config.vibe: { baseline: 40 }
+    src/services/evm.vibe: { baseline: 225 }
+    src/services/nonce.vibe: { baseline: 80 }
+    src/services/predeploy.vibe: { baseline: 81 }
+    src/services/signer.vibe: { baseline: 114 }
+    src/services/storage.vibe: { baseline: 170 }
+    src/services/transport-decorators.vibe: { baseline: 206 }
+    src/services/transport.vibe: { baseline: 375 }
+    src/streams/index.vibe: { baseline: 231 }
+    src/testing/index.vibe: { baseline: 2 }
+    src/testing/math.ts: { baseline: 24 }
+    src/testing/memory-backend.vibe: { baseline: 803 }
+    src/types.vibe: { baseline: 360 }
+    src/voltaire/index.vibe: { baseline: 405 }
+    src/voltaire/locate-voltaire-effect.ts: { baseline: 32 }
+    src/voltaire/native-voltaire.ts: { baseline: 144 }
+  runtime-deps:
+    dependencies: { baseline: 2 }
+    peerDependencies: { baseline: 3 }
+
+quality:
+  platform-isolation:
+    "*": { baseline: pass }
+    src/voltaire/locate-voltaire-effect.ts: { baseline: fail }
+  typed-errors:
+    "*": { baseline: pass }
+    src/platform/node-backend.ts: { baseline: fail }
+    src/voltaire/native-voltaire.ts: { baseline: fail }
+  type-escape-hatches:
+    "*": { baseline: pass }
+    src/platform/node-backend.ts: { baseline: fail }
+    src/services/codec.vibe: { baseline: fail }
+    src/voltaire/native-voltaire.ts: { baseline: fail }
+  function-length:
+    "*": { baseline: pass }
+    src/services/storage.vibe: { baseline: fail }
+    src/testing/memory-backend.vibe: { baseline: fail }
+  effect-boundaries:
+    "*": { baseline: pass }
+  hygiene:
+    "*": { baseline: pass }
+    src/platform/node-backend.ts: { baseline: fail }
+
+architecture:
+  subsystem-tests:
+    "*": { baseline: pass }
+    src/testing: { baseline: fail }
+  test-ratio:
+    "*": { target: 60 }
+    src/actions: { baseline: 18 }
+    src/platform: { baseline: 59 }
+    src/server: { baseline: 37 }
+    src/services: { baseline: 31 }
+    src/streams: { baseline: 42 }
+    src/testing: { baseline: 0 }
+    src/voltaire: { baseline: 56 }
+  docs-and-exports:
+    "*": { baseline: pass }

@@ -1,5 +1,7 @@
 # tevm-effect Contributor & Agent Guide
 
+Follow the [Uphill rules](.agents/uphill/rules.md), which `uphill rules --write` rewrites from each metric's description: @.agents/uphill/rules.md
+
 - **Language & Runtime**: Written in VibeLang (`.vibe`) targeting Effect `4.1.1` (`vibelang@0.0.13`), compiling to standard ESM JS + `.d.ts` declarations.
 - **Version Control**: Use Jujutsu (`jj`) for all repository operations.
 - **Aggressive Dependency Injection**:

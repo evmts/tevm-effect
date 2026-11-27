@@ -7,3 +7,4 @@ coverage/
 .smithers/cache/
 .smithers/reports/
 .flows/
+.uphill/
