@@ -94,7 +94,7 @@ const test = S.Shell.Test({
   summary: "Run the hermetic vitest suite (including native @evmts/zevm@0.1.0) through vibelang-vite.",
   bin: S.NodeModule.Bin("vitest"),
   args: ["run", ...externalSuites.flatMap((suite) => ["--exclude", suite])],
-  data: [config, sources, tests]
+  data: [config, sources, tests, S.file(".smithers/factory.json")]
 })
 
 // Sibling-checkout interop tests (e.g. voltaire-effect v2 before npm publish).
