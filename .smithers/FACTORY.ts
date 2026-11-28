@@ -37,6 +37,9 @@ export const upstreamProbe = S.Flow({
 })
 
 export const factory = S.Factory({
+  triggers: {
+    "manual-uphill": { _tag: "TriggerBinding", flow: "uphill", on: { _tag: "Manual" }, title: "Run Uphill audit" }
+  },
   summary: "tevm-effect: incremental VibeLang CI, Effect Layer DI and EVM correctness review, and weekly Effect/VibeLang/Voltaire drift probes.",
   flows: [review, issueRepro, issuePoc, prTriage, upstreamProbe],
   on: {

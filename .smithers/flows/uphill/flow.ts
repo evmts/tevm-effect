@@ -6,23 +6,14 @@
  * against `.agents/uphill/uphill.baseline.yaml`.
  */
 import { Flow } from "@smthrs/flow"
-import { Node } from "@smthrs/plan"
 import { CiJob } from "@smthrs/sandbox"
 import { Schema } from "effect"
 
-const implementationVersion = "uphill/v1"
-
 const uphillJob = CiJob.make("uphill", {
-  steps: [
-    {
-      name: "install-uphill",
-      run: "command -v uphill >/dev/null 2>&1 || curl -fsSL https://wevm.sh/uphill | sh"
-    },
-    {
-      name: "uphill",
-      run: "PATH=\"$HOME/.uphill/bin:$HOME/.bun/bin:$PATH\" uphill --compact"
-    }
-  ]
+  steps: [{
+    name: "uphill",
+    run: "npm exec --yes --package=bun@1.4.2 --package=uphill@0.0.11 -- sh -ec 'uphill check && uphill --compact && test -s .uphill/report.json'"
+  }]
 })
 
 export default Flow.make("uphill", {
@@ -36,15 +27,7 @@ export default Flow.make("uphill", {
     tier: "reversible"
   },
   modelInvocable: true,
-  payload: Schema.Struct({
-    run: CiJob.Target.fields.run,
-    repo: CiJob.Target.fields.repo,
-    sha: CiJob.Target.fields.sha,
-    ref: CiJob.Target.fields.ref
-  }),
+  payload: { run: Schema.String, repo: Schema.String, sha: Schema.String, ref: Schema.String, event: Schema.String },
   success: CiJob.Result,
-  body: Node.capture(
-    { implementationVersion },
-    (target: CiJob.Target) => uphillJob.call(target)
-  )
+  body: (run) => uphillJob.call(run)
 })
